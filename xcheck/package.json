@@ -1,0 +1,1 @@
+{ "private": true, "type": "module", "dependencies": { "canonicalize": "5.1.0" } }
