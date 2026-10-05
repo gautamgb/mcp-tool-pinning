@@ -33,7 +33,7 @@ The demo server copies the trigger Pillar Security reported for Deadbugz: after 
 3. A pinned client does the same. `summarize` is withheld, the call to it is refused, and
    the diff against the pinned definition is shown.
 4. The scanner's Tool Set Digest and the pinned client's disagree: the server served them
-   different definitions (SEP section 4).
+   different definitions (SEP section 5).
 
 ## Layout
 

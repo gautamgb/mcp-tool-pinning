@@ -62,7 +62,7 @@ async def main() -> None:
             print(f"   call refused: {exc}\n")
         client_digest = pinned.last_tool_set_digest
 
-    print("4. Compare tool set digests (section 4)")
+    print("4. Compare tool set digests (section 5)")
     print(f"   scanner        {scanner_digest}")
     print(f"   pinned client  {client_digest}")
     verdict = (
