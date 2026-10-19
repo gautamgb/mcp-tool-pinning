@@ -73,3 +73,23 @@ def test_canonical_body_hashes_to_digest() -> None:
     assert body == b'{"inputSchema":{"type":"object"},"name":"t"}'
     assert tool_digest(tool) == "sha256:" + hashlib.sha256(body).hexdigest()
     assert canonical_body({"name": "\ud800"}) is None
+
+
+RAW_DIR = Path(__file__).parent.parent / "vectors" / "digest"
+RAW_INDEX: dict[str, dict[str, Any]] = json.loads((RAW_DIR / "index.json").read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize("case", sorted(RAW_INDEX))
+def test_raw_vector(case: str) -> None:
+    text = (RAW_DIR / f"{case}.json").read_bytes().decode("utf-8")
+    assert tool_digest(json.loads(text)) == RAW_INDEX[case]["expected"]
+
+
+def test_every_raw_file_is_indexed() -> None:
+    files = {p.stem for p in RAW_DIR.glob("*.json")} - {"index"}
+    assert files == set(RAW_INDEX)
+
+
+def test_parsed_vectors_are_a_subset_of_raw() -> None:
+    for vector in VECTORS:
+        assert RAW_INDEX[vector["name"]]["expected"] == vector["expected"]
