@@ -36,6 +36,23 @@ def _numbers_in_range(value: Any) -> bool:
     return False
 
 
+def _well_formed(value: Any) -> bool:
+    """False if any key or string holds a UTF-16 surrogate code point.
+
+    `json.loads` joins a valid escaped pair into one code point above U+FFFF,
+    so a surrogate left in a Python str is always unpaired. RFC 8785 serializes to UTF-8, which cannot
+    encode one. Checked here so the rule does not depend on which exception the
+    canonicalization library raises.
+    """
+    if isinstance(value, str):
+        return not any("\ud800" <= ch <= "\udfff" for ch in value)
+    if isinstance(value, Mapping):
+        return all(_well_formed(k) and _well_formed(v) for k, v in value.items())
+    if isinstance(value, list):
+        return all(_well_formed(v) for v in value)
+    return True
+
+
 def _sha256(data: bytes) -> str:
     return PREFIX + hashlib.sha256(data).hexdigest()
 
@@ -47,12 +64,29 @@ def tool_digest(tool: Mapping[str, Any]) -> str | None:
     treats the tool as unapproved.
     """
     body = {k: v for k, v in tool.items() if k != "_meta"}
-    if not _numbers_in_range(body):
+    if not (_well_formed(body) and _numbers_in_range(body)):
         return None
     try:
         return _sha256(rfc8785.dumps(body))
-    except rfc8785.CanonicalizationError:
+    except (rfc8785.CanonicalizationError, UnicodeEncodeError):
         return None
+
+
+def canonical_body(tool: Mapping[str, Any]) -> bytes | None:
+    """RFC 8785 bytes of the tool minus top-level `_meta`; sha256 of these is the digest.
+
+    These are the bytes of a lock contract file. None when the tool has no digest.
+    """
+    if tool_digest(tool) is None:
+        return None
+    return rfc8785.dumps({k: v for k, v in tool.items() if k != "_meta"})
+
+
+def instructions_digest(instructions: str) -> str | None:
+    """SHA-256 over the RFC 8785 form of the instructions as a JSON string."""
+    if not _well_formed(instructions):
+        return None
+    return _sha256(rfc8785.dumps(instructions))
 
 
 def tool_set_digest(tools: Iterable[Mapping[str, Any]]) -> str | None:
