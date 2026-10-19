@@ -42,8 +42,26 @@ The demo server copies the trigger Pillar Security reported for Deadbugz: after 
 - `session.py`: `PinnedClientSession`, a `ClientSession` subclass implementing section 3.
 - `store.py`: JSON pin store. The host chooses one file per server identity.
 - `demo_server.py`, `demo.py`, `connect.py`: the demo and an in-process connection helper.
-- `vectors/tools.json`: test vectors. `xcheck/` recomputes them with an independent RFC
-  8785 implementation (npm `canonicalize`): `cd xcheck && npm install && node xcheck.mjs`.
+- `lockref.py`: reference checker for the lock format draft.
+- `vectors/`: test vectors. `xcheck/` recomputes them with an independent RFC 8785
+  implementation (npm `canonicalize`): `cd xcheck && npm install && node xcheck.mjs`.
+
+## Lock format draft and vectors
+
+`spec/mcp-lock-draft-1.md` is a draft file format for keeping approved tool digests in a
+repository (`.mcp/lock/` and `.mcp/contracts/`) and the check a host runs against it. It is
+not stable; files written against it carry `lockVersion: "1-draft"`.
+
+`vectors/` holds the cases a Python and a TypeScript implementation are both tested against:
+parsed and raw-text digest cases, identity normalization, and one directory per lock case
+with its expected outcome. `src/mcp_tool_pinning/lockref.py` is a small reference checker
+that passes them. Nothing in `vectors/` is edited by hand:
+
+    uv run python tools/gen_vectors.py          # rebuild vectors/
+    uv run python tools/gen_vectors.py --check  # fail if vectors/ is stale
+
+`vectors/SHA256SUMS` covers every file under `vectors/`, for vendoring. The xcheck script
+also runs the raw-text cases and contract files through JavaScript.
 
 ## Design notes
 
