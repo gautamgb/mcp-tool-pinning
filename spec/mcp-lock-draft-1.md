@@ -1,12 +1,12 @@
-# MCP tool lock format, draft 1
+# MCP tool lock format, draft 1c
 
-Draft 1. Not stable. Files written against it carry lockVersion 1-draft and a future version 1
-reader rejects them.
+Draft 1c. Not stable. Files written against it carry lockVersion 1-draft and a future version 1
+reader rejects them. Section 13 lists what changed from draft 1b.
 
 - Author: Gautam Bharti
 - Date: 2026-10-19
 - Builds on: SEP draft "Client-Held Tool Definition Pinning" (Tool Definition Digest)
-- Test vectors: `vectors/` in this repository, tag `vectors-draft-1b`
+- Test vectors: `vectors/` in this repository, tag `vectors-draft-1c`
 
 ## 1. Scope
 
@@ -35,8 +35,9 @@ remove the top-level `_meta` member, serialize under RFC 8785, hash the UTF-8 by
 and write `sha256:` followed by 64 lower-case hex characters. `_meta` members below the top
 level are kept. Every other member is covered, including members this draft does not know.
 
-Because the top-level `_meta` is outside the digest, nothing about it is approved. A host
-relays it unchanged to its client and MUST NOT place it in model context.
+The top-level `_meta` is outside the digest, so the digest says nothing about it. A lock
+approves it separately through the meta digest (section 2.3), and section 9.2.3 says what a
+host relays. A host MUST NOT place `_meta` in model context.
 
 A tool has no digest if any of these hold:
 
@@ -48,7 +49,11 @@ A tool has no digest if any of these hold:
    cannot serialize it. A host MUST test for this explicitly before canonicalizing, so the
    result does not depend on how a canonicalization library fails. A valid escaped pair is one
    code point and gets a digest.
-3. It cannot otherwise be serialized under RFC 8785.
+3. It has a value nested more than 512 levels deep. The tool object is at depth 0, and a
+   member value or array element is one level deeper than the object or array that holds it.
+   A host tests this before canonicalizing, for the same reason as rule 2, and so that a
+   deeply nested listing cannot exhaust its stack.
+4. It cannot otherwise be serialized under RFC 8785.
 
 A host computes the digest over the raw JSON of the result, before any SDK model parses it.
 Models that drop unknown members, or JSON parsers that drop or rename keys such as
@@ -68,6 +73,13 @@ The instructions digest is SHA-256 over the RFC 8785 serialization of the server
 `instructions` value as a JSON string (that is, the quoted, escaped string), in the same
 `sha256:` form. Instructions that are not a string, or that contain an unpaired surrogate, have
 no digest.
+
+### 2.3 Meta digest
+
+The meta digest is SHA-256 over the RFC 8785 serialization of a tool's top-level `_meta`
+value, in the same `sha256:` form. A `_meta` that is not an object has no meta digest, and
+neither does one that the rules of section 2.1 exclude, counting `_meta` at depth 1 as it sits
+in the tool.
 
 ## 3. Server identity
 
@@ -281,11 +293,15 @@ A value that would match only under a Unicode digit class, or only with a traili
   environment variable names matching `^[A-Za-z_][A-Za-z0-9_]*$`; never values). A writer MUST
   NOT write secrets into `args`.
 - `instructions` (optional): `{"digest": "<instructions digest>"}`.
-- `tools` (required): an object keyed by tool name. Each entry has exactly:
-  - `digest`: the approved tool digest.
-  - `contract`: the contract filename for that digest (section 6).
-  - `approval`: `subject` (string), `at` (RFC 3339 time, section 4.4), `via` (one of `pr`, `runtime`, `api`,
-    `migrated`) and optionally `ref` (string: a commit, ticket or event id).
+- `tools` (required): an object keyed by tool name. Each entry has:
+  - `digest` (required): the approved tool digest.
+  - `contract` (required): the contract filename for that digest (section 6).
+  - `approval` (required): `subject` (string), `at` (RFC 3339 time, section 4.4), `via` (one
+    of `pr`, `runtime`, `api`, `migrated`) and optionally `ref` (string: a commit, ticket or
+    event id).
+  - `metaDigest` (optional): the meta digest (section 2.3) of the tool's top-level `_meta` as
+    approved. A writer records it whenever the tool it approves has a top-level `_meta` with a
+    meta digest, and omits it otherwise. A value that is not a digest is `lock-unreadable`.
 
 Any other top-level member, any other member in a tool entry or approval, or another `via`
 value is `lock-unsupported`.
@@ -350,14 +366,25 @@ Whether a host requires a signature, and which signer identity it accepts (certi
 and subject), are host configuration held outside the lock repository. Neither is ever read
 from the lock or from an environment variable that the lock repository can set.
 
+A host with a signer identity configured MUST also be configured with a sequence store: a
+place outside the lock repository where it keeps the highest `sequence` it has accepted for
+this lock. Without one, step 3 below has nothing to compare against, and a validly signed older
+manifest would be accepted after a newer one. A host configuration that names a signer and no
+sequence store is refused when the host loads it, with `lock-signature-invalid` and a detail
+that names the missing sequence store.
+
 With a signer identity configured, a host MUST, in this order:
 
 1. require `MANIFEST.json` and `MANIFEST.json.sigstore`;
 2. verify the bundle over the manifest bytes against the configured identity, with the trust
    root the host is configured with;
-3. parse the manifest and refuse a `sequence` lower than the last value it accepted for this
-   lock;
+3. parse the manifest and refuse a `sequence` lower than its floor: the larger of the value in
+   the sequence store and the highest value this reader has accepted since it was created;
 4. check the file set and hashes (section 8.1) and continue reading.
+
+A reader keeps the floor in memory for each store it reads, so a sequence store that is
+deleted or rewritten while the host runs does not lower it. After accepting a manifest, the
+host writes its `sequence` to the store when it is higher than the stored value.
 
 A failure in steps 1 to 3 is `lock-signature-invalid`, in every posture. A host that supports
 signing as an optional component and finds it absent while an identity is configured fails the
@@ -398,6 +425,59 @@ A listing entry that is not an object with a string `name` is never shown and ca
 Names in the shard that are absent from the listing are reported as removed. Removal is not a
 failure.
 
+### 9.2.1 Listing in progress
+
+A listing starts when the host sends `tools/list` without a cursor: for a proxy, when it relays
+one from its client; for a host that collects the pages itself, when it asks for the first
+page. It ends when the page without `nextCursor` has been checked, or when it fails (section
+9.5). While a listing is in progress, every `tools/call` is refused with `no-listing`,
+including calls to names that the previous listing allowed. A cursorless `tools/list` sent
+while a listing is in progress starts a new listing, and the earlier one is abandoned.
+
+A `notifications/tools/list_changed` from the server does not change the allow-list. It marks a
+listing as due. The allow-list changes when the next listing completes, and that listing
+replaces it. A host that collects the pages itself SHOULD start a listing when one is due. A
+notification that arrives during a listing does not end that listing.
+
+### 9.2.2 Frames that carry tools
+
+Only the response to a `tools/list` request the host sent, and that is still unanswered, can
+carry tools to the model. The host matches a response to a request by `id`, comparing JSON
+type and value exactly: a string matches only an equal string, and a number only an equal
+number. `"1"` does not match `1`, `true` does not match `1`, and `null` matches nothing, so a
+`tools/list` sent with a null id never receives a listing. Unanswered `tools/list` requests
+are matched first, and the host's unanswered `initialize` request second.
+
+The host drops a frame from the server, and reports it, when the frame:
+
+- is not a JSON object (a batch, for example);
+- has a `method` member and also a `result` or `error` member;
+- has a `result` object with a `tools` member and does not match an unanswered `tools/list`
+  request. This includes a frame with no `id` or a null `id`, an `id` that matches nothing,
+  and a match to `initialize`;
+- has a `result` object with an `instructions` member and matches neither an unanswered
+  `tools/list` request nor the unanswered `initialize` request.
+
+When a dropped frame matches a request the client is waiting on, the host answers that request
+with a JSON-RPC error so the client is not left waiting.
+
+### 9.2.3 Top-level `_meta`
+
+For each tool it shows, under `guard`, the host decides the tool's top-level `_meta`:
+
+- a served tool without a top-level `_meta` needs no decision;
+- when the entry has a `metaDigest` and the served `_meta` has the same meta digest, the host
+  relays `_meta` unchanged;
+- when the entry has a `metaDigest` and the served `_meta` has a different meta digest or
+  none, the host removes the top-level `_meta` from the tool it relays and flags the tool
+  `meta-changed`;
+- when the entry has no `metaDigest`, or there is no entry, the host removes the top-level
+  `_meta` and flags the tool `meta-unapproved`.
+
+The tool stays shown and callable, since its definition matched; only its metadata is not
+relayed. Nothing else in the tool is changed. Under `monitor` the host relays `_meta`
+unchanged and reports the same flags.
+
 ### 9.3 Instructions
 
 If the server sent instructions and the shard has no instructions digest, or the served
@@ -422,10 +502,15 @@ gets a JSON-RPC error and is not sent to the server:
     {"code": -32011, "message": "Tool withheld by lock",
      "data": {"reason": "upstream-changed", "tool": "fetch"}}
 
-`data.reason` is the tool's reason from section 9.2 when the name was withheld, the lock
-failure under section 9.4, `lock-stale` under section 9.8, `unreachable` when the latest
-listing on this connection failed, `no-listing` when no listing has been checked on this
-connection, and `not-listed` when the name was not in the latest listing.
+`data.reason` is the first of these that applies:
+
+1. `no-listing`, when a listing is in progress (section 9.2.1) or none has completed on this
+   connection;
+2. the lock failure, when the latest listing was decided under section 9.4;
+3. `unreachable`, when the latest listing on this connection failed;
+4. `lock-stale`, under section 9.8;
+5. the tool's reason from section 9.2, when the name was withheld;
+6. `not-listed`, when the name was not in the latest listing.
 
 A listing fails when the server answers `tools/list` with an error, sends a result without a
 `tools` array, cannot be asked for a further page, or exceeds a limit the host sets on pages or
@@ -449,24 +534,29 @@ person authorized.
 | `new-tool`, `upstream-changed`, `no-digest`, `duplicate-name` | one tool |
 | `unlocked-server` | every tool of one server |
 | `instructions-changed` | the server's instructions |
+| `meta-changed`, `meta-unapproved` | one shown tool's top-level `_meta` (section 9.2.3) |
 | `lock-unreadable`, `lock-unsupported`, `lock-signature-invalid`, `contract-mismatch` | the whole lock |
 | `no-listing`, `not-listed` | one call |
 | `unreachable` | every call on one connection after its latest listing failed (section 9.5) |
 | `lock-stale` | every decision made from a snapshot past the host's maximum staleness (section 9.8) |
 | `classifier-error` | a host's change classifier failed; the decision does not proceed |
 
-`classifier-error`, `unreachable` and `lock-stale` are defined for hosts and have no vectors. A
-host that labels changes for reviewers MUST NOT let a classifier error lead to a tool being
-shown.
+`classifier-error` is defined for hosts and has no vectors. `unreachable`, `lock-stale` and
+`no-listing` during a listing are covered by the session vectors (section 12). A host that
+labels changes for reviewers MUST NOT let a classifier error lead to a tool being shown.
 
 ### 9.8 Snapshots and staleness
 
 A host may load the lock into a snapshot, from files or from another store, and decide several
-listings and calls from it. Such a host SHOULD configure a maximum staleness. Before it decides
-a listing or a call from a snapshot older than that, it reloads the snapshot. If the reload
-fails, the decision is refused with `lock-stale`: a listing is handled as in section 9.4 with
-that reason, and a call gets `data.reason` `lock-stale`. A host MAY skip the reload and refuse
-straight away.
+listings and calls from it. Such a host has a maximum staleness, set by its configuration; the
+default is 60 seconds. Before it decides a listing or a call from a snapshot older than that,
+it reloads the snapshot. If the reload fails, the decision is refused with `lock-stale`: a
+listing is handled as in section 9.4 with that reason, and a call gets `data.reason`
+`lock-stale`. The next call tries the reload again.
+
+A call decided from a listing that failed under section 9.4 gets that failure's reason, never
+`lock-stale`, and does not trigger a reload: its allow-list is already empty, and only a new
+listing can change it.
 
 A reload between listings re-checks the connection's latest listing against the new snapshot.
 The new allow-list is the names allowed both before and after the reload, so a reload can
@@ -491,9 +581,10 @@ By type:
 
 - `listing`, one per checked listing: `posture`, `lockError` (code or null), `counts`
   (`served`, `shown`, `withheld`, `removed`), `tools` (array of `{"name", "served", "approved",
-  "decision", "reason"}`, where `served` and `approved` are digests or null, `decision` is
-  `shown` or `withheld`, and `reason` is a code or null), `removed` (names) and `instructions`
-  (code or null). It MAY carry `snapshotId`, a string naming the store snapshot the decision
+  "decision", "reason", "meta"}`, where `served` and `approved` are digests or null,
+  `decision` is `shown` or `withheld`, `reason` is a code or null, and `meta` is
+  `meta-changed`, `meta-unapproved` or null), `removed` (names) and `instructions` (code or
+  null). It MAY carry `snapshotId`, a string naming the store snapshot the decision
   used; its form is up to the store.
 - `refusal`: `tool`, `reason`.
 - `approval`: `tool`, `digest`, `via`, `subject`, `ref`.
@@ -510,9 +601,9 @@ credentials. Tool names come from the server and are untrusted text; consumers e
      "counts": {"served": 2, "shown": 1, "withheld": 1, "removed": 0},
      "tools": [
        {"name": "search", "served": "sha256:...", "approved": "sha256:...",
-        "decision": "shown", "reason": null},
+        "decision": "shown", "reason": null, "meta": null},
        {"name": "fetch", "served": "sha256:...", "approved": "sha256:...",
-        "decision": "withheld", "reason": "upstream-changed"}],
+        "decision": "withheld", "reason": "upstream-changed", "meta": null}],
      "removed": [], "instructions": null}
 
 ## 11. Known limits
@@ -526,8 +617,12 @@ credentials. Tool names come from the server and are untrusted text; consumers e
 - A CI check that lists a server to compare against the lock uses its own connection, and a
   server can answer it differently from the host's connection. Its result is advisory. Only the
   host's check on the connection the model uses enforces anything.
-- The top-level `_meta` is outside the tool digest and is relayed unpinned, which is why section
-  2.1 keeps it out of model context.
+- The meta digest approves the top-level `_meta` as a whole. When a server changes any part of
+  it, a host under `guard` removes all of it, including parts the client relies on, such as a
+  UI resource. The tool still works without them.
+- Only the frame shapes in section 9.2.2 are dropped. A server can still answer a request the
+  host relays with content of its choosing; the lock covers tool definitions and instructions,
+  not results.
 - Without a configured signer, anyone who can write to the repository can change the lock.
   Repository review is then the only control.
 - The `sequence` rule protects only against rollback to a manifest older than one the host has
@@ -545,13 +640,50 @@ credentials. Tool names come from the server and are untrusted text; consumers e
   case gives `command` and `args` as the launch line has them; an `error` case is one where
   derivation fails.
 - `lock/<case>/`: a lock root (`.mcp/`), `listing.json` (absent when the case has no listing),
-  `server.json` (the identity), `config.json` (`posture`, and optionally `requireManifest`,
-  `signer`, `lastSequence`), `expected.json` and, where needed, `setup.json`, which lists
-  symlinks and files the test runner creates before running the case. `expected.json` has
-  `lockError`, `shown` (names in listing order), `withheld` and `flagged` (name to reason,
-  for guard and monitor respectively), `removed`, `instructions`, `stripInstructions` and
-  `calls` (name to `allow` or a reason).
+  `server.json` (the identity), `config.json`, `expected.json` and, where needed,
+  `setup.json`, which lists symlinks and files the test runner creates before running the
+  case, and `session.json`.
+- `config.json` has `posture`, and optionally `requireManifest`, `signer`, `sequenceStore`
+  (true when the host has a sequence store), `lastSequence` (the value in it), `maxStaleness`
+  (seconds, default 60) and `testVerifier`.
+- `expected.json` has `lockError`, `shown` (names in listing order), `withheld` and `flagged`
+  (name to reason, for guard and monitor respectively), `removed`, `instructions`,
+  `stripInstructions`, `calls` (name to `allow` or a reason) and `meta` (for each shown tool
+  with a top-level `_meta`, `{"relay": true or false, "flag": "meta-changed",
+  "meta-unapproved" or null}`).
+- `session.json`, when present, has `steps`: an array run in order against one connection
+  whose clock starts at 0. `{"op": "list-start"}` starts a listing; `{"op": "list-complete",
+  "listing": "<file>"}` completes it with that file's result, loading the lock for it;
+  `{"op": "list-fail"}` fails it; `{"op": "list-changed"}` is a
+  `notifications/tools/list_changed`; `{"op": "clock", "advance": <seconds>}` moves the clock;
+  `{"op": "write", "path": "<path>", "text": "<text>"}` replaces a file under the case
+  directory; and `{"op": "call", "tool": "<name>", "expect": "<allow or reason>"}` is a call
+  whose verdict must equal `expect`. The cases assume a host that reloads exactly when the
+  snapshot is older than the maximum staleness, no sooner.
+- `frames.json`: section 9.2.2. Each case gives `inflight` (ids of unanswered `tools/list`
+  requests), optionally `handshake` (the id of the unanswered `initialize`), a `frame` from
+  the server and `expect`: `listing` (checked as a page), `handshake` (its instructions are
+  checked), `drop` or `relay`.
 - `SHA256SUMS`: SHA-256 of every file above, for vendoring.
 
-The vectors include no valid Sigstore bundle. The two signing cases expect
-`lock-signature-invalid` from a missing bundle and from a placeholder bundle.
+The vectors include no valid Sigstore bundle. `testVerifier: "accept-any"` tells the test
+runner to verify bundles with a stub that accepts any bytes, so that a case can reach the
+checks after verification (the sequence floor, for one). It exists only in test runners and is
+never a host setting. Without it, a signing case expects `lock-signature-invalid` from a
+missing or placeholder bundle.
+
+## 13. Changes from draft 1b
+
+- Section 2.1: a value nested more than 512 levels deep has no digest.
+- Sections 2.3, 5.1 and 9.2.3: an optional `metaDigest` per tool entry approves the top-level
+  `_meta`; under `guard` an unapproved or changed `_meta` is removed and flagged. A draft 1b
+  reader reports a shard that uses it as `lock-unsupported`.
+- Section 8.2: a signer requires a sequence store, and readers keep an in-memory floor.
+- Section 9.2.1: calls during a listing get `no-listing`, and `list_changed` alone no longer
+  changes the allow-list.
+- Section 9.2.2: frames that can carry tools or instructions are matched exactly and dropped
+  otherwise.
+- Section 9.5: the order of call reasons is fixed.
+- Section 9.8: the maximum staleness defaults to 60 seconds, a host always tries the reload,
+  and a whole-lock failure is reported before `lock-stale`.
+- Section 10: listing event tool entries carry `meta`.

@@ -53,8 +53,9 @@ repository (`.mcp/lock/` and `.mcp/contracts/`) and the check a host runs agains
 not stable; files written against it carry `lockVersion: "1-draft"`.
 
 `vectors/` holds the cases a Python and a TypeScript implementation are both tested against:
-parsed and raw-text digest cases, identity normalization, and one directory per lock case
-with its expected outcome. `src/mcp_tool_pinning/lockref.py` is a small reference checker
+parsed and raw-text digest cases, identity normalization, the classification of frames from
+a server, and one directory per lock case with its expected outcome and, for some, a session of
+listings and calls. `src/mcp_tool_pinning/lockref.py` is a small reference checker
 that passes them. Nothing in `vectors/` is edited by hand:
 
     uv run python tools/gen_vectors.py          # rebuild vectors/
