@@ -13,7 +13,7 @@ import os
 import re
 import stat
 from collections import Counter
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -29,12 +29,38 @@ POSTURES = ("monitor", "guard", "strict")
 REGISTRIES = ("npm", "pypi", "oci")
 DEFAULT_PORTS = {"http": 80, "https": 443}
 
-SHARD_NAME = re.compile(r"^([a-z0-9]+(?:-[a-z0-9]+)*)--([0-9a-f]{16})\.json$")
-CONTRACT_NAME = re.compile(r"^sha256-([0-9a-f]{64})\.json$")
-DIGEST = re.compile(r"^sha256:([0-9a-f]{64})$")
-RFC3339 = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$")
-ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# Section 4.4: every pattern is ASCII-only and matched with fullmatch. `\d` would accept other
+# scripts' digits and `$` would accept a trailing newline, so neither is used.
+SHARD_NAME = re.compile(r"([a-z0-9]+(?:-[a-z0-9]+)*)--([0-9a-f]{16})\.json")
+CONTRACT_NAME = re.compile(r"sha256-([0-9a-f]{64})\.json")
+DIGEST = re.compile(r"sha256:([0-9a-f]{64})")
+RFC3339 = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})")
+ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 SLUG_MAX = 48
+SEQUENCE_MAX = 2**53 - 1
+
+# Section 3.2.1: secret-looking launch arguments. ASCII-only, case-insensitive.
+SECRET_SEGMENTS = frozenset(
+    {
+        "token", "secret", "password", "passwd", "pwd", "apikey", "auth", "authorization",
+        "credential", "credentials", "bearer", "cookie", "key", "pat", "privatekey", "session",
+    }
+)
+SECRET_VALUE = re.compile(
+    r"^(bearer|basic|token)[ \t]+[^ \t]"
+    r"|\bsk-[A-Za-z0-9_-]{16,}"
+    r"|\bsk_(live|test)_[A-Za-z0-9]{10,}"
+    r"|\bgh[pousr]_[A-Za-z0-9]{20,}"
+    r"|\bgithub_pat_[A-Za-z0-9_]{20,}"
+    r"|\bglpat-[A-Za-z0-9_-]{16,}"
+    r"|\bxox[abprs]-[A-Za-z0-9-]{10,}"
+    r"|\bAKIA[0-9A-Z]{16}\b"
+    r"|\bAIza[0-9A-Za-z_-]{30,}"
+    r"|\bnpm_[A-Za-z0-9]{30,}"
+    r"|-----BEGIN [A-Z ]*PRIVATE KEY"
+    r"|\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.",
+    re.ASCII | re.IGNORECASE,
+)
 
 MANIFEST = "MANIFEST.json"
 SIGNATURE = "MANIFEST.json.sigstore"
@@ -104,11 +130,70 @@ def package_identity(registry: str, name: str) -> dict[str, str]:
     return {"kind": "stdio", "package": f"{registry}:{name}"}
 
 
-def command_identity(command: str) -> dict[str, str]:
+def command_identity(command: str, args: Sequence[str] = ()) -> dict[str, Any]:
+    """Section 3.2 command form: the command's basename and its arguments verbatim.
+
+    Raises ValueError for a command that is not a basename after trimming the path, and for
+    secret-looking arguments (section 3.2.1), which an identity can neither keep nor strip.
+    """
     base = command.replace("\\", "/").rsplit("/", 1)[-1]
     if not _valid_command(base):
         raise ValueError(f"invalid command {command!r}")
-    return {"kind": "stdio", "command": base}
+    kept = list(args)
+    if not all(isinstance(a, str) and _well_formed(a) for a in kept):
+        raise ValueError("args must be strings without unpaired surrogates")
+    problem = secret_arg_problem(kept)
+    if problem is not None:
+        raise ValueError(f"cannot form an identity: {problem}; pass the secret in an env var or use an alias")
+    return {"kind": "stdio", "command": base, "args": kept}
+
+
+def _well_formed(text: str) -> bool:
+    return not any("\ud800" <= ch <= "\udfff" for ch in text)
+
+
+def _secret_name(name: str) -> bool:
+    segments = re.split(r"[-_.]+", name.lstrip("-").lower())
+    return any(s in SECRET_SEGMENTS for s in segments) or "".join(segments) in SECRET_SEGMENTS
+
+
+def _url_problem(arg: str) -> str | None:
+    if "://" not in arg:
+        return None
+    rest = arg.split("://", 1)[1]
+    authority = re.split(r"[/?#]", rest, maxsplit=1)[0]
+    if ":" in authority.rpartition("@")[0]:
+        return "a URL argument carries a password in its userinfo"
+    if "?" in rest:
+        query = rest.split("?", 1)[1].split("#", 1)[0]
+        for part in query.split("&"):
+            if _secret_name(part.split("=", 1)[0]):
+                return "a URL argument carries a credential in its query"
+    return None
+
+
+def secret_arg_problem(args: Sequence[str]) -> str | None:
+    """None if no argument is secret-looking (section 3.2.1), else what was found."""
+    value_of: str | None = None
+    for arg in args:
+        if value_of is not None and not arg.startswith("-"):
+            return f"the value of {value_of} looks like a credential"
+        value_of = None
+        if SECRET_VALUE.search(arg):
+            return "an argument matches a credential pattern"
+        if (problem := _url_problem(arg)) is not None:
+            return problem
+        head, eq, tail = arg.partition("=")
+        if arg.startswith("-"):
+            if _secret_name(head):
+                if eq and tail:
+                    return f"{head} carries a credential"
+                if not eq:
+                    value_of = head
+            continue
+        if eq and ENV_NAME.fullmatch(head) and _secret_name(head):
+            return f"{head}= carries a credential"
+    return None
 
 
 def _valid_package_name(name: str) -> bool:
@@ -119,10 +204,12 @@ def _valid_command(name: str) -> bool:
     return _valid_package_name(name) and "/" not in name and "\\" not in name and name not in (".", "..")
 
 
-def validate_identity(identity: Any) -> dict[str, str]:
+def validate_identity(identity: Any) -> dict[str, Any]:
     """Return the identity if it is well formed, else raise LockError."""
-    if not isinstance(identity, dict) or not all(isinstance(v, str) for v in identity.values()):
-        raise _unreadable("identity must be an object of strings")
+    if not isinstance(identity, dict) or not all(
+        isinstance(v, str) or k == "args" for k, v in identity.items()
+    ):
+        raise _unreadable("identity members must be strings, args an array of strings")
     kind = identity.get("kind")
     if kind == "remote":
         if set(identity) != {"kind", "url"}:
@@ -138,9 +225,16 @@ def validate_identity(identity: Any) -> dict[str, str]:
             registry, _, name = identity["package"].partition(":")
             if registry not in REGISTRIES or not _valid_package_name(name):
                 raise _unreadable(f"invalid package {identity['package']!r}")
-        elif set(identity) == {"kind", "command"}:
-            if not _valid_command(identity["command"]):
-                raise _unreadable(f"command must be a basename: {identity['command']!r}")
+        elif set(identity) == {"kind", "command", "args"}:
+            args = identity["args"]
+            if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+                raise _unreadable("identity args must be an array of strings")
+            try:
+                ok = command_identity(identity["command"], args) == identity
+            except ValueError:
+                ok = False
+            if not ok:
+                raise _unreadable("identity command is not a basename, or its args cannot form an identity")
         else:
             raise _unsupported(f"stdio identity members {sorted(identity)}")
     else:
@@ -148,15 +242,15 @@ def validate_identity(identity: Any) -> dict[str, str]:
     return identity
 
 
-def identity_key(identity: Mapping[str, str]) -> bytes:
+def identity_key(identity: Mapping[str, Any]) -> bytes:
     return rfc8785.dumps(dict(identity))
 
 
-def identity_h16(identity: Mapping[str, str]) -> str:
+def identity_h16(identity: Mapping[str, Any]) -> str:
     return hashlib.sha256(identity_key(identity)).hexdigest()[:16]
 
 
-def slug(identity: Mapping[str, str]) -> str:
+def slug(identity: Mapping[str, Any]) -> str:
     if identity["kind"] == "remote":
         parts = urlsplit(identity["url"])
         source = (parts.hostname or "") + parts.path
@@ -169,7 +263,7 @@ def slug(identity: Mapping[str, str]) -> str:
     return text or "server"
 
 
-def shard_filename(identity: Mapping[str, str]) -> str:
+def shard_filename(identity: Mapping[str, Any]) -> str:
     return f"{slug(identity)}--{identity_h16(identity)}.json"
 
 
@@ -178,7 +272,7 @@ def shard_filename(identity: Mapping[str, str]) -> str:
 
 @dataclass(frozen=True)
 class Shard:
-    identity: dict[str, str]
+    identity: dict[str, Any]
     tools: dict[str, str]
     instructions: str | None
 
@@ -186,7 +280,7 @@ class Shard:
 @dataclass(frozen=True)
 class Lock:
     shards: dict[bytes, Shard]
-    aliases: dict[str, dict[str, str]]
+    aliases: dict[str, dict[str, Any]]
     sequence: int | None
 
 
@@ -211,10 +305,21 @@ def _reject_constant(name: str) -> Any:
     raise ValueError(f"non-JSON constant {name}")
 
 
+def _reject_float(token: str) -> Any:
+    # Section 4.3: numbers in lock files are integer tokens. json hands any token with a
+    # fraction or an exponent here, including 1.0 and 1e0.
+    raise ValueError(f"number {token} is not an integer token")
+
+
 def strict_json(data: bytes, what: str) -> Any:
     try:
         text = data.decode("utf-8")
-        return json.loads(text, object_pairs_hook=_reject_duplicates, parse_constant=_reject_constant)
+        return json.loads(
+            text,
+            object_pairs_hook=_reject_duplicates,
+            parse_constant=_reject_constant,
+            parse_float=_reject_float,
+        )
     except (UnicodeDecodeError, ValueError) as exc:
         raise _unreadable(f"{what}: {exc}") from exc
 
@@ -244,7 +349,8 @@ def _read_lock_dir(lock_dir: Path) -> dict[str, bytes]:
         name = entry.name
         if not name.isascii():
             raise _unreadable(f"non-ASCII filename {name!r}")
-        if not (name in (MANIFEST, SIGNATURE, ALIASES) or SHARD_NAME.match(name)):
+        shard = SHARD_NAME.fullmatch(name)
+        if not (name in (MANIFEST, SIGNATURE, ALIASES) or (shard and len(shard.group(1)) <= SLUG_MAX)):
             raise _unreadable(f"unexpected file {name!r}")
         files[name] = _read_regular(lock_dir / name)
     return files
@@ -274,7 +380,7 @@ def _check_manifest(files: dict[str, bytes], config: ReaderConfig) -> int | None
         raise _unsupported(f"MANIFEST.json members {sorted(manifest)}")
     sequence = manifest.get("sequence")
     listed = manifest.get("files")
-    if type(sequence) is not int or sequence < 0 or not isinstance(listed, dict):
+    if type(sequence) is not int or not 0 <= sequence <= SEQUENCE_MAX or not isinstance(listed, dict):
         raise _unreadable("MANIFEST.json sequence or files malformed")
     if signed and config.last_sequence is not None and sequence < config.last_sequence:
         raise LockError("lock-signature-invalid", f"sequence {sequence} < {config.last_sequence}")
@@ -287,7 +393,7 @@ def _check_manifest(files: dict[str, bytes], config: ReaderConfig) -> int | None
     return sequence
 
 
-def _check_aliases(raw: bytes) -> dict[str, dict[str, str]]:
+def _check_aliases(raw: bytes) -> dict[str, dict[str, Any]]:
     doc = strict_json(raw, ALIASES)
     if not isinstance(doc, dict):
         raise _unreadable("aliases.json is not an object")
@@ -313,7 +419,7 @@ def _check_attributes(attributes: Any) -> None:
         value = attributes.get(key, [])
         if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
             raise _unreadable(f"attributes.{key} must be an array of strings")
-    if not all(ENV_NAME.match(v) for v in attributes.get("env", [])):
+    if not all(ENV_NAME.fullmatch(v) for v in attributes.get("env", [])):
         raise _unreadable("attributes.env holds names only")
 
 
@@ -333,14 +439,14 @@ def _check_entry(name: str, entry: Any, contracts: Path) -> str:
         raise _unreadable(f"tool {name!r} approval lacks subject, at or via")
     if "ref" in approval and not isinstance(approval["ref"], str):
         raise _unreadable(f"tool {name!r} approval ref must be a string")
-    if not RFC3339.match(approval["at"]):
+    if not RFC3339.fullmatch(approval["at"]):
         raise _unreadable(f"tool {name!r} approval time is not RFC 3339")
     if approval["via"] not in VIA:
         raise _unsupported(f"tool {name!r} approval via {approval['via']!r}")
     digest, contract = entry["digest"], entry["contract"]
-    if not isinstance(digest, str) or not (match := DIGEST.match(digest)):
+    if not isinstance(digest, str) or not (match := DIGEST.fullmatch(digest)):
         raise _unreadable(f"tool {name!r} digest malformed")
-    if not isinstance(contract, str) or not CONTRACT_NAME.match(contract):
+    if not isinstance(contract, str) or not CONTRACT_NAME.fullmatch(contract):
         raise _unreadable(f"tool {name!r} contract is not a contract filename: {contract!r}")
     if contract != f"sha256-{match.group(1)}.json":
         raise LockError("contract-mismatch", f"tool {name!r} contract filename differs from digest")
@@ -366,7 +472,7 @@ def _check_shard(filename: str, raw: bytes, contracts: Path) -> Shard:
     if "identity" not in doc or "tools" not in doc:
         raise _unreadable(f"{filename} lacks identity or tools")
     identity = validate_identity(doc["identity"])
-    match = SHARD_NAME.match(filename)
+    match = SHARD_NAME.fullmatch(filename)
     assert match is not None
     if identity_h16(identity) != match.group(2):
         raise _unreadable(f"{filename} identity does not hash to its filename")
@@ -380,7 +486,7 @@ def _check_shard(filename: str, raw: bytes, contracts: Path) -> Shard:
         if set(block) - {"digest"}:
             raise _unsupported(f"{filename} instructions members {sorted(block)}")
         instructions = block.get("digest")
-        if not isinstance(instructions, str) or not DIGEST.match(instructions):
+        if not isinstance(instructions, str) or not DIGEST.fullmatch(instructions):
             raise _unreadable(f"{filename} instructions digest malformed")
     tools = doc["tools"]
     if not isinstance(tools, dict):
@@ -403,7 +509,7 @@ def load_lock(root: Path, config: ReaderConfig | None = None) -> Lock:
     aliases = _check_aliases(files[ALIASES]) if ALIASES in files else {}
     shards: dict[bytes, Shard] = {}
     for name in sorted(files):
-        if not SHARD_NAME.match(name):
+        if not SHARD_NAME.fullmatch(name):
             continue
         shard = _check_shard(name, files[name], contracts)
         key = identity_key(shard.identity)
@@ -431,7 +537,7 @@ class Decision:
 
 
 def check_listing(
-    lock: Lock | LockError, identity: Mapping[str, str], listing: Mapping[str, Any], posture: str
+    lock: Lock | LockError, identity: Mapping[str, Any], listing: Mapping[str, Any], posture: str
 ) -> Decision:
     if posture not in POSTURES:
         raise ValueError(f"unknown posture {posture!r}")

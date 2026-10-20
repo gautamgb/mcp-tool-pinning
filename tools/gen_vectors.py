@@ -349,7 +349,10 @@ def build_digest(out: Path, legacy_source: Path) -> None:
 
 # Identity cases
 
-IDENTITY_CASES: list[tuple[str, dict[str, str], Callable[[], dict[str, str]] | None]] = [
+GIT_A = "git+https://github.com/example/mcp-server-a"
+GIT_B = "git+https://github.com/example/mcp-server-b"
+
+IDENTITY_CASES: list[tuple[str, dict[str, Any], Callable[[], dict[str, Any]] | None]] = [
     (
         "remote-basic",
         {"url": "https://mcp.example.com/v1/mcp"},
@@ -406,17 +409,55 @@ IDENTITY_CASES: list[tuple[str, dict[str, str], Callable[[], dict[str, str]] | N
     ("unknown-registry", {"registry": "cargo", "name": "mcp-server"}, None),
     (
         "command-basename",
-        {"command": "/usr/local/bin/my-server"},
-        lambda: command_identity("/usr/local/bin/my-server"),
+        {"command": "/usr/local/bin/my-server", "args": []},
+        lambda: command_identity("/usr/local/bin/my-server", []),
     ),
-    ("command-dotdot", {"command": ".."}, None),
+    ("command-dotdot", {"command": "..", "args": []}, None),
+    (
+        "command-args-git-a",
+        {"command": "uvx", "args": [GIT_A]},
+        lambda: command_identity("uvx", [GIT_A]),
+    ),
+    (
+        "command-args-git-b",
+        {"command": "uvx", "args": [GIT_B]},
+        lambda: command_identity("uvx", [GIT_B]),
+    ),
+    (
+        "command-args-paths-verbatim",
+        {"command": "/usr/local/bin/node", "args": ["/srv/mcp/server.js", "--root", "./data"]},
+        lambda: command_identity("/usr/local/bin/node", ["/srv/mcp/server.js", "--root", "./data"]),
+    ),
+    (
+        "command-args-segment-not-substring",
+        {"command": "my-server", "args": ["--author", "docs-team", "--keyword=search"]},
+        lambda: command_identity("my-server", ["--author", "docs-team", "--keyword=search"]),
+    ),
+    ("command-args-secret-flag", {"command": "my-server", "args": ["--api-key", "abc123"]}, None),
+    ("command-args-secret-flag-inline", {"command": "my-server", "args": ["--token=abc123"]}, None),
+    ("command-args-secret-env", {"command": "my-server", "args": ["GITHUB_TOKEN=abc123"]}, None),
+    ("command-args-secret-shape", {"command": "my-server", "args": ["ghp_" + "A" * 36]}, None),
+    (
+        "command-args-url-userinfo",
+        {"command": "uvx", "args": ["git+https://user:pw@git.example.com/mcp-server"]},
+        None,
+    ),
+    (
+        "command-args-url-user-only",
+        {"command": "uvx", "args": ["git+ssh://git@github.com/example/mcp-server-a"]},
+        lambda: command_identity("uvx", ["git+ssh://git@github.com/example/mcp-server-a"]),
+    ),
+    ("command-args-url-query", {"command": "my-server", "args": ["https://example.com/sse?token=abc123"]}, None),
     (
         "slug-long",
         {"url": "https://" + "a" * 30 + ".example.com/" + "b" * 30},
         lambda: remote_identity("https://" + "a" * 30 + ".example.com/" + "b" * 30),
     ),
-    ("slug-empty", {"command": "___"}, lambda: command_identity("___")),
+    ("slug-empty", {"command": "___", "args": []}, lambda: command_identity("___", [])),
 ]
+
+# Two identities that must differ: the case named first, then the case it must not equal.
+IDENTITY_DISTINCT = [("command-args-git-a", "command-args-git-b")]
 
 IDENTITY_NOTES = {
     "remote-basic": "Already normalized.",
@@ -433,11 +474,30 @@ IDENTITY_NOTES = {
     "oci-tag-dropped": "OCI: registry and repository, lower case, tag removed (the version is an attribute).",
     "oci-digest-dropped": "OCI digest removed; a registry port stays in the name.",
     "unknown-registry": "Registry must be npm, pypi or oci.",
-    "command-basename": "Command identity keeps only the basename.",
+    "command-basename": "Command identity keeps only the basename of the command; no args gives [].",
     "command-dotdot": "'..' is not a basename.",
+    "command-args-git-a": "Command form carries the args, so this launch ...",
+    "command-args-git-b": "... and this one, naming another repository, are two identities.",
+    "command-args-paths-verbatim": "Only the command is cut to its basename; paths in args are kept as given.",
+    "command-args-segment-not-substring": "Flag names match secret words by whole segment: --author and --keyword pass.",
+    "command-args-secret-flag": "A flag named for a credential, with its value in the next argument: no identity.",
+    "command-args-secret-flag-inline": "A flag named for a credential with an inline value: no identity.",
+    "command-args-secret-env": "NAME=value whose name marks a credential: no identity.",
+    "command-args-secret-shape": "A value with a known token shape: no identity.",
+    "command-args-url-userinfo": "A URL with a password in its userinfo: no identity.",
+    "command-args-url-user-only": "A user name without a password, as in git+ssh://git@..., is not a secret.",
+    "command-args-url-query": "A URL whose query names a credential: no identity.",
     "slug-long": "Slug truncated to 48 characters, then trailing '-' trimmed.",
     "slug-empty": "Nothing left after collapsing: slug is 'server'.",
 }
+
+
+def derive(given: dict[str, Any]) -> dict[str, Any]:
+    if "url" in given:
+        return remote_identity(given["url"])
+    if "registry" in given:
+        return package_identity(given["registry"], given["name"])
+    return command_identity(given["command"], given["args"])
 
 
 def build_identity(out: Path) -> None:
@@ -445,7 +505,12 @@ def build_identity(out: Path) -> None:
     for name, given, make in IDENTITY_CASES:
         entry: dict[str, Any] = {"name": name, "input": given, "note": IDENTITY_NOTES[name]}
         if make is None:
-            entry["error"] = True
+            try:
+                derive(given)
+            except ValueError:
+                entry["error"] = True
+            else:
+                raise SystemExit(f"identity {name}: declared an error, but derivation succeeded")
         else:
             identity = make()
             entry |= {
@@ -456,6 +521,10 @@ def build_identity(out: Path) -> None:
                 "filename": shard_filename(identity),
             }
         cases.append(entry)
+    by_name = {c["name"]: c for c in cases}
+    for a, b in IDENTITY_DISTINCT:
+        if by_name[a]["h16"] == by_name[b]["h16"]:
+            raise SystemExit(f"identity {a} and {b} must differ")
     (out / "identity.json").write_text(dump(cases), encoding="utf-8")
 
 
@@ -464,6 +533,8 @@ def build_identity(out: Path) -> None:
 REMOTE = {"kind": "remote", "url": "https://mcp.example.com/v1/mcp"}
 OTHER = {"kind": "remote", "url": "https://other.example.net/mcp"}
 PACKAGE = {"kind": "stdio", "package": "npm:@example/docs-server"}
+COMMAND_A = {"kind": "stdio", "command": "uvx", "args": ["git+https://github.com/example/mcp-server-a"]}
+COMMAND_B = {"kind": "stdio", "command": "uvx", "args": ["git+https://github.com/example/mcp-server-b"]}
 
 SEARCH = {
     "name": "search",
@@ -522,7 +593,7 @@ class Builder:
 
     def shard(
         self,
-        identity: dict[str, str],
+        identity: dict[str, Any],
         tools: list[dict[str, Any]],
         instructions: str | None = None,
         filename: str | None = None,
@@ -554,7 +625,7 @@ class Builder:
             doc["instructions"] = instructions
         self.write("listing.json", dump(doc))
 
-    def server(self, identity: dict[str, str]) -> None:
+    def server(self, identity: dict[str, Any]) -> None:
         self.write("server.json", dump(identity))
 
     def config(self, posture: str = "guard", **extra: Any) -> None:
@@ -629,6 +700,93 @@ def case_stdio_package_approved(b: Builder) -> None:
     b.server(PACKAGE)
     b.config()
     all_shown(b)
+
+
+def case_command_args_approved(b: Builder) -> None:
+    b.shard(COMMAND_A, [SEARCH, FETCH])
+    b.listing([SEARCH, FETCH])
+    b.server(COMMAND_A)
+    b.config()
+    all_shown(b)
+
+
+def case_command_args_differ(b: Builder) -> None:
+    b.shard(COMMAND_A, [SEARCH, FETCH])
+    b.listing([SEARCH, FETCH])
+    b.server(COMMAND_B)
+    b.config()
+    b.expect(
+        withheld={"search": "unlocked-server", "fetch": "unlocked-server"},
+        calls={"search": "unlocked-server", "fetch": "unlocked-server"},
+    )
+
+
+def case_identity_command_without_args(b: Builder) -> None:
+    standard(b)
+    b.shard({"kind": "stdio", "command": "my-server"}, [SEARCH])
+    lock_failure(b, "lock-unsupported")
+
+
+def case_identity_args_secret(b: Builder) -> None:
+    standard(b)
+    b.shard({"kind": "stdio", "command": "my-server", "args": ["--token", "abc123"]}, [SEARCH])
+    lock_failure(b, "lock-unreadable")
+
+
+def _edit_text(b: Builder, rel: str, old: str, new: str) -> None:
+    path = b.root / rel
+    text = path.read_text(encoding="utf-8")
+    assert old in text, (rel, old)
+    path.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+
+def case_digest_non_ascii_digit(b: Builder) -> None:
+    standard(b)
+    # U+0663 ARABIC-INDIC DIGIT THREE in place of the last hex character.
+    b.shard(
+        REMOTE,
+        [SEARCH, FETCH],
+        INSTRUCTIONS,
+        edit=lambda d: d["tools"]["fetch"].update(digest="sha256:" + _hex(FETCH)[:63] + "\u0663"),
+    )
+    lock_failure(b, "lock-unreadable")
+
+
+def case_digest_trailing_newline(b: Builder) -> None:
+    standard(b)
+    b.shard(
+        REMOTE,
+        [SEARCH, FETCH],
+        INSTRUCTIONS,
+        edit=lambda d: d["tools"]["fetch"].update(digest="sha256:" + _hex(FETCH) + "\n"),
+    )
+    lock_failure(b, "lock-unreadable")
+
+
+def case_time_non_ascii_digit(b: Builder) -> None:
+    standard(b)
+    # U+0660 ARABIC-INDIC DIGIT ZERO in the seconds.
+    b.shard(
+        REMOTE,
+        [SEARCH, FETCH],
+        INSTRUCTIONS,
+        edit=lambda d: d["tools"]["fetch"]["approval"].update(at="2026-10-19T17:00:0\u0660Z"),
+    )
+    lock_failure(b, "lock-unreadable")
+
+
+def case_sequence_fraction(b: Builder) -> None:
+    standard(b)
+    b.manifest()
+    _edit_text(b, ".mcp/lock/MANIFEST.json", '"sequence": 1,', '"sequence": 1.0,')
+    lock_failure(b, "lock-unreadable")
+
+
+def case_sequence_exponent(b: Builder) -> None:
+    standard(b)
+    b.manifest()
+    _edit_text(b, ".mcp/lock/MANIFEST.json", '"sequence": 1,', '"sequence": 1e0,')
+    lock_failure(b, "lock-unreadable")
 
 
 def case_new_tool(b: Builder) -> None:
@@ -851,7 +1009,7 @@ def case_symlinked_shard(b: Builder) -> None:
 
 def case_alias_command_traversal(b: Builder) -> None:
     standard(b)
-    aliases = {"docs": REMOTE, "evil": {"kind": "stdio", "command": "../../bin/sh"}}
+    aliases = {"docs": REMOTE, "evil": {"kind": "stdio", "command": "../../bin/sh", "args": []}}
     b.write(".mcp/lock/aliases.json", dump({"lockVersion": "1-draft", "aliases": aliases}))
     lock_failure(b, "lock-unreadable")
 
@@ -952,6 +1110,21 @@ def case_calls(b: Builder) -> None:
 LOCK_CASES: dict[str, tuple[Callable[[Builder], None], str]] = {
     "all-approved": (case_all_approved, "Every served tool and the instructions match the lock."),
     "stdio-package-approved": (case_stdio_package_approved, "Stdio server identified by its npm coordinate."),
+    "command-args-approved": (case_command_args_approved, "Stdio server in the command form, args included."),
+    "command-args-differ": (
+        case_command_args_differ,
+        "Same command, other args: another identity, so the server is unlocked.",
+    ),
+    "identity-command-without-args": (
+        case_identity_command_without_args,
+        "Command identity in the earlier two-member form.",
+    ),
+    "identity-args-secret": (case_identity_args_secret, "Shard identity whose args hold a credential."),
+    "digest-non-ascii-digit": (case_digest_non_ascii_digit, "Approved digest ends in a non-ASCII digit."),
+    "digest-trailing-newline": (case_digest_trailing_newline, "Approved digest ends in a newline."),
+    "time-non-ascii-digit": (case_time_non_ascii_digit, "Approval time has a non-ASCII digit."),
+    "sequence-fraction": (case_sequence_fraction, "MANIFEST.json sequence written as 1.0."),
+    "sequence-exponent": (case_sequence_exponent, "MANIFEST.json sequence written as 1e0."),
     "new-tool": (case_new_tool, "A served tool has no entry in the shard."),
     "changed-tool": (case_changed_tool, "A served tool's digest differs from the approved one."),
     "no-digest-tool": (case_no_digest_tool, "A served tool contains 2^53 and has no digest."),

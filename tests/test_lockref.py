@@ -88,12 +88,12 @@ def test_lock_vector(case: str, tmp_path: Path) -> None:
 def test_identity_vector(case: dict[str, Any]) -> None:
     given = case["input"]
 
-    def make() -> dict[str, str]:
+    def make() -> dict[str, Any]:
         if "url" in given:
             return remote_identity(given["url"])
         if "registry" in given:
             return package_identity(given["registry"], given["name"])
-        return command_identity(given["command"])
+        return command_identity(given["command"], given["args"])
 
     if case.get("error"):
         with pytest.raises(ValueError):

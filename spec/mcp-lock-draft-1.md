@@ -6,7 +6,7 @@ reader rejects them.
 - Author: Gautam Bharti
 - Date: 2026-10-19
 - Builds on: SEP draft "Client-Held Tool Definition Pinning" (Tool Definition Digest)
-- Test vectors: `vectors/` in this repository, tag `vectors-draft-1`
+- Test vectors: `vectors/` in this repository, tag `vectors-draft-1b`
 
 ## 1. Scope
 
@@ -34,6 +34,9 @@ The tool digest is the SEP Tool Definition Digest: take the `Tool` object exactl
 remove the top-level `_meta` member, serialize under RFC 8785, hash the UTF-8 bytes with SHA-256,
 and write `sha256:` followed by 64 lower-case hex characters. `_meta` members below the top
 level are kept. Every other member is covered, including members this draft does not know.
+
+Because the top-level `_meta` is outside the digest, nothing about it is approved. A host
+relays it unchanged to its client and MUST NOT place it in model context.
 
 A tool has no digest if any of these hold:
 
@@ -69,8 +72,9 @@ no digest.
 ## 3. Server identity
 
 A server's identity is a JSON object of one of three forms. It names the server, not one
-running copy of it: version, launch arguments and OAuth audience go in shard attributes
-(section 5.2), and the digests decide whether anything that matters changed.
+running copy of it: version and OAuth audience go in shard attributes (section 5.1), and the
+digests decide whether anything that matters changed. Launch arguments are attributes too,
+except in the command form (section 3.2), where they are part of the identity.
 
 ### 3.1 Remote
 
@@ -91,7 +95,7 @@ The URL is normalized as follows:
 ### 3.2 Stdio
 
     {"kind": "stdio", "package": "<registry>:<name>"}
-    {"kind": "stdio", "command": "<basename>"}
+    {"kind": "stdio", "command": "<basename>", "args": ["<arg>", ...]}
 
 `registry` is one of `npm`, `pypi` or `oci`. The name excludes any version, tag or digest:
 
@@ -103,13 +107,67 @@ The URL is normalized as follows:
 
 Names are printable ASCII without spaces.
 
-The `command` form is used only when the server has no registry coordinate. Its value is the
-basename of the command: it MUST NOT contain `/` or `\`, and MUST NOT be `.` or `..`.
+The `command` form is used only when the launch line gives no registry coordinate. `command` is
+the basename of the command as launched: everything up to the last `/` or `\` is removed, and
+the result MUST NOT be `.` or `..`. `args` is every argument after the command, in order and
+verbatim; a path among them is kept as given, and no arguments is `[]`. Without `args`, every
+launch of one tool that a host cannot parse (`uvx git+https://...` naming two different
+repositories, say) would share one identity and one shard.
+
+Identity derivation fails, with an error that names the rule, if any argument is
+secret-looking (section 3.2.1) or contains an unpaired surrogate. A writer does not strip the
+argument and carry on, since the result would no longer describe the launch.
+
+Because the arguments are verbatim, a path that differs between machines gives each machine its
+own identity. Hosts SHOULD name such servers by an alias (section 7), so the identity is written
+once in the lock instead of being derived from each machine's launch line.
+
+### 3.2.1 Secret-looking arguments
+
+The rules below are ASCII-only. Letters match without regard to case, `[...]` classes contain
+only the ASCII characters listed, and `\b` is a boundary between `[A-Za-z0-9_]` and any other
+character or either end of the text. An argument is secret-looking if any of these holds:
+
+1. It contains a match for one of these patterns:
+
+        ^(bearer|basic|token)[ \t]+[^ \t]
+        \bsk-[A-Za-z0-9_-]{16,}
+        \bsk_(live|test)_[A-Za-z0-9]{10,}
+        \bgh[pousr]_[A-Za-z0-9]{20,}
+        \bgithub_pat_[A-Za-z0-9_]{20,}
+        \bglpat-[A-Za-z0-9_-]{16,}
+        \bxox[abprs]-[A-Za-z0-9-]{10,}
+        \bAKIA[0-9A-Z]{16}\b
+        \bAIza[0-9A-Za-z_-]{30,}
+        \bnpm_[A-Za-z0-9]{30,}
+        -----BEGIN [A-Z ]*PRIVATE KEY
+        \beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.
+
+2. It starts with `-`, its name (the text before the first `=`) is a secret name, and it
+   either has a non-empty value after `=` or is followed by an argument that does not start
+   with `-` (that argument is its value).
+3. It has the form `NAME=value`, where `NAME` matches `[A-Za-z_][A-Za-z0-9_]*` and is a secret
+   name.
+4. It contains `://`, and either the authority (the text after the first `://` up to the first
+   `/`, `?` or `#`) has a `:` before its last `@`, which is a password, or the query (the text
+   after the first `?` up to the first `#`) has a parameter, split on `&`, whose name before
+   `=` is a secret name.
+
+A name is a secret name if, after removing leading `-`, lower-casing and splitting on runs of
+`-`, `_` and `.`, one of its segments, or all segments joined, is one of: `token`, `secret`,
+`password`, `passwd`, `pwd`, `apikey`, `auth`, `authorization`, `credential`, `credentials`,
+`bearer`, `cookie`, `key`, `pat`, `privatekey`, `session`. Segments are matched whole, so
+`--author` and `--keyword` are not secret names. A user name without a password, as in
+`git+ssh://git@github.com/...`, is not secret-looking. Rules 1 to 3 are the ones a writer
+already applies to `attributes.args` (section 5.1). A writer may strip userinfo and queries from
+URLs in attributes, but an identity keeps its arguments verbatim, so rule 4 refuses them
+instead.
 
 An identity object has exactly the members shown for its form. A reader that meets another
-`kind`, or other members, reports `lock-unsupported`. A remote URL that is not already in
-normalized form, a package with an unknown registry, or a command that is not a basename is
-`lock-unreadable`.
+`kind`, or other members, reports `lock-unsupported`; that includes a command identity without
+`args`. A remote URL that is not already in normalized form, a package with an unknown
+registry, a command that is not a basename, or `args` that is not an array of strings or that
+identity derivation would refuse is `lock-unreadable`.
 
 ### 3.3 Identity key and h16
 
@@ -175,9 +233,25 @@ A reader reads each file's bytes once and verifies and parses those same bytes. 
 lock as a unit: a failure in any file under `.mcp/lock`, or in any contract a shard references,
 fails the whole load, and section 9.4 applies to every server.
 
+Every number in a lock file MUST be an integer token: an optional `-` followed by digits, with
+no fraction and no exponent. `1.0` and `1e0` are `lock-unreadable` even where a parser returns
+the integer 1; a reader whose parser does not keep that distinction checks the raw text.
+
 Type errors and missing required members are `lock-unreadable`. A member, `lockVersion`,
 identity `kind` or `via` value that draft 1 does not define is `lock-unsupported`, so that a
 reader can tell an old reader from a damaged file.
+
+### 4.4 Syntax
+
+Every pattern in this document matches the whole value and only ASCII. `[0-9]` is the ten ASCII
+digits, so a digit from another script does not match, and no pattern accepts a trailing line
+break. This covers digests (`sha256:[0-9a-f]{64}`), approval times, shard and contract
+filenames, slugs, h16 and environment variable names. An approval time matches
+
+    [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})
+
+A value that would match only under a Unicode digit class, or only with a trailing newline, is
+`lock-unreadable`.
 
 ## 5. Shard
 
@@ -210,7 +284,7 @@ reader can tell an old reader from a damaged file.
 - `tools` (required): an object keyed by tool name. Each entry has exactly:
   - `digest`: the approved tool digest.
   - `contract`: the contract filename for that digest (section 6).
-  - `approval`: `subject` (string), `at` (RFC 3339 time), `via` (one of `pr`, `runtime`, `api`,
+  - `approval`: `subject` (string), `at` (RFC 3339 time, section 4.4), `via` (one of `pr`, `runtime`, `api`,
     `migrated`) and optionally `ref` (string: a commit, ticket or event id).
 
 Any other top-level member, any other member in a tool entry or approval, or another `via`
@@ -260,7 +334,7 @@ covered by the manifest like any other file.
 `files` covers every file in `.mcp/lock` except `MANIFEST.json` and `MANIFEST.json.sigstore`.
 When a manifest is present, the set of those files on disk MUST equal the set of `files` keys
 exactly, and each file's SHA-256 MUST equal its entry. An extra file, a missing file or a
-different hash is `lock-unreadable`. `sequence` is a non-negative integer that a writer
+different hash is `lock-unreadable`. `sequence` is an integer from 0 to 2^53 - 1 that a writer
 increases on every change.
 
 Contract files are not listed. Each is bound by the digest in a shard, and the shard is bound
@@ -349,8 +423,15 @@ gets a JSON-RPC error and is not sent to the server:
      "data": {"reason": "upstream-changed", "tool": "fetch"}}
 
 `data.reason` is the tool's reason from section 9.2 when the name was withheld, the lock
-failure under section 9.4, `no-listing` when no listing has been checked on this connection,
-and `not-listed` when the name was not in the latest listing.
+failure under section 9.4, `lock-stale` under section 9.8, `unreachable` when the latest
+listing on this connection failed, `no-listing` when no listing has been checked on this
+connection, and `not-listed` when the name was not in the latest listing.
+
+A listing fails when the server answers `tools/list` with an error, sends a result without a
+`tools` array, cannot be asked for a further page, or exceeds a limit the host sets on pages or
+tools. After a failed listing the host refuses every call on that connection with
+`unreachable` until a listing completes. It does not fall back to the allow-list of an earlier
+listing.
 
 Code -32011 is distinct from -32010, which the same hosts use for drift holds outside lock mode.
 
@@ -370,11 +451,30 @@ person authorized.
 | `instructions-changed` | the server's instructions |
 | `lock-unreadable`, `lock-unsupported`, `lock-signature-invalid`, `contract-mismatch` | the whole lock |
 | `no-listing`, `not-listed` | one call |
+| `unreachable` | every call on one connection after its latest listing failed (section 9.5) |
+| `lock-stale` | every decision made from a snapshot past the host's maximum staleness (section 9.8) |
 | `classifier-error` | a host's change classifier failed; the decision does not proceed |
-| `unreachable` | the host could not get a listing from the server |
 
-`classifier-error` and `unreachable` are defined for hosts and have no vectors. A host that
-labels changes for reviewers MUST NOT let a classifier error lead to a tool being shown.
+`classifier-error`, `unreachable` and `lock-stale` are defined for hosts and have no vectors. A
+host that labels changes for reviewers MUST NOT let a classifier error lead to a tool being
+shown.
+
+### 9.8 Snapshots and staleness
+
+A host may load the lock into a snapshot, from files or from another store, and decide several
+listings and calls from it. Such a host SHOULD configure a maximum staleness. Before it decides
+a listing or a call from a snapshot older than that, it reloads the snapshot. If the reload
+fails, the decision is refused with `lock-stale`: a listing is handled as in section 9.4 with
+that reason, and a call gets `data.reason` `lock-stale`. A host MAY skip the reload and refuse
+straight away.
+
+A reload between listings re-checks the connection's latest listing against the new snapshot.
+The new allow-list is the names allowed both before and after the reload, so a reload can
+withhold a name, for example after a revocation, but never makes one callable. A name becomes
+callable again only through a listing checked under section 9.2.
+
+A host that loads the lock for every listing still holds a snapshot between listings, and the
+rules above apply to calls made in that interval.
 
 ## 10. Events
 
@@ -393,7 +493,8 @@ By type:
   (`served`, `shown`, `withheld`, `removed`), `tools` (array of `{"name", "served", "approved",
   "decision", "reason"}`, where `served` and `approved` are digests or null, `decision` is
   `shown` or `withheld`, and `reason` is a code or null), `removed` (names) and `instructions`
-  (code or null).
+  (code or null). It MAY carry `snapshotId`, a string naming the store snapshot the decision
+  used; its form is up to the store.
 - `refusal`: `tool`, `reason`.
 - `approval`: `tool`, `digest`, `via`, `subject`, `ref`.
 - `override`: `posture`, `until`, `subject`, `ref`. The override record itself is not part of
@@ -425,8 +526,8 @@ credentials. Tool names come from the server and are untrusted text; consumers e
 - A CI check that lists a server to compare against the lock uses its own connection, and a
   server can answer it differently from the host's connection. Its result is advisory. Only the
   host's check on the connection the model uses enforces anything.
-- `_meta` is outside the tool digest. A host that shows `_meta` content to the model has to pin
-  it by other means.
+- The top-level `_meta` is outside the tool digest and is relayed unpinned, which is why section
+  2.1 keeps it out of model context.
 - Without a configured signer, anyone who can write to the repository can change the lock.
   Repository review is then the only control.
 - The `sequence` rule protects only against rollback to a manifest older than one the host has
@@ -440,7 +541,9 @@ credentials. Tool names come from the server and are untrusted text; consumers e
 - `digest/<case>.json` and `digest/index.json`: raw-text cases. The file bytes are the input;
   `index.json` maps each case to the expected digest or null and a note. Implementations parse
   the text with their own JSON parser.
-- `identity.json`: identity normalization, identity keys, h16, slugs and filenames.
+- `identity.json`: identity normalization, identity keys, h16, slugs and filenames. A command
+  case gives `command` and `args` as the launch line has them; an `error` case is one where
+  derivation fails.
 - `lock/<case>/`: a lock root (`.mcp/`), `listing.json` (absent when the case has no listing),
   `server.json` (the identity), `config.json` (`posture`, and optionally `requireManifest`,
   `signer`, `lastSequence`), `expected.json` and, where needed, `setup.json`, which lists

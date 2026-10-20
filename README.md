@@ -83,8 +83,8 @@ twice in one listing is withheld, every copy.
 The SDK's `call_tool` can itself issue a `tools/list` when it has no output schema for a
 tool. That listing goes through the same checks and replaces the current approvals.
 
-The top-level `_meta` is outside the digest and is passed through to the host unpinned. A
-host that shows `_meta` content to the model has to pin it separately.
+The top-level `_meta` is outside the digest and is passed through to the host unpinned. The
+lock draft says a host relays it unchanged and keeps it out of model context.
 
 ## Findings so far
 
