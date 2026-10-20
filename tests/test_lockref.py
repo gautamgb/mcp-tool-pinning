@@ -46,6 +46,9 @@ def build_host_layout(case: dict[str, Any], base: Path) -> Path:
     for rel in case.get("files", []):
         (base / rel).parent.mkdir(parents=True, exist_ok=True)
         (base / rel).write_text("", encoding="utf-8")
+    for item in case.get("texts", []):
+        (base / item["path"]).parent.mkdir(parents=True, exist_ok=True)
+        (base / item["path"]).write_text(item["text"], encoding="utf-8")
     for link in case.get("symlinks", []):
         (base / link["path"]).parent.mkdir(parents=True, exist_ok=True)
         os.symlink(link["target"], base / link["path"])

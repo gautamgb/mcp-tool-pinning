@@ -1,4 +1,4 @@
-"""Reference checker for the lock format, draft 1 revision 1d (spec/mcp-lock-draft-1.md).
+"""Reference checker for the lock format, draft 1 revision 1e (spec/mcp-lock-draft-1.md).
 
 It exists to pin the spec down against the vectors in vectors/. It reads a lock, checks
 listings against it, builds the listing event, decides calls, classifies upstream frames,
@@ -768,44 +768,96 @@ def split_pending(pending: Sequence[Mapping[str, Any]]) -> tuple[list[Any], list
 # Host configuration paths (section 8.2)
 
 
+def _git_file_kind(path: Path) -> str:
+    """What a `.git` file points at: "module" when its gitdir lies under a `modules`
+    directory inside a git directory (a submodule), "worktree" when it lies under
+    `worktrees` (a linked worktree), else "unknown"."""
+    try:
+        with open(path, "rb") as fh:
+            text = fh.read(4096).decode("utf-8", "replace")
+    except OSError:
+        return "unknown"
+    line = text.splitlines()[0] if text else ""
+    if not line.startswith("gitdir:"):
+        return "unknown"
+    target = os.path.normpath(os.path.join(os.path.dirname(path), line[len("gitdir:"):].strip()))
+    parts = target.split(os.sep)
+    if ".git" not in parts:
+        return "unknown"
+    tail = parts[len(parts) - parts[::-1].index(".git"):]
+    if "modules" in tail:
+        return "module"
+    if tail[:1] == ["worktrees"]:
+        return "worktree"
+    return "unknown"
+
+
 def repository_root(lock_root: Path) -> Path:
-    """The repository that holds the lock: the nearest directory at or above the lock root
-    that has a `.git` entry (a directory, or a file as in a worktree), else the lock root."""
+    """The repository that holds the lock (section 8.2). Walking up from the resolved lock
+    root: a `.git` directory ends the walk there, and so does a `.git` file whose gitdir is
+    a linked worktree's. Any other `.git` file (a submodule's, or one this cannot read)
+    marks a candidate and the walk goes on, so a submodule resolves to its superproject.
+    The candidate stands when nothing above it has a `.git` entry; with no entry at all the
+    repository is the lock root."""
     start = Path(os.path.realpath(lock_root))
-    for candidate in (start, *start.parents):
-        if os.path.lexists(candidate / ".git"):
-            return candidate
-    return start
+    candidate: Path | None = None
+    for probe in (start, *start.parents):
+        git = probe / ".git"
+        if not os.path.lexists(git):
+            continue
+        if os.path.isdir(git) or _git_file_kind(git) == "worktree":
+            return probe
+        if candidate is None:
+            candidate = probe
+    return candidate or start
 
 
-def _resolved(path: Path) -> Path:
-    """realpath of the nearest existing ancestor, with the rest of the path appended."""
-    path = Path(os.path.abspath(path))
-    rest: list[str] = []
-    probe = path
-    while not os.path.lexists(probe) and probe != probe.parent:
-        rest.append(probe.name)
-        probe = probe.parent
-    return Path(os.path.realpath(probe)).joinpath(*reversed(rest))
+def _identity(path: str) -> tuple[int, int] | None:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino)
 
 
-def _within(path: Path, root: Path) -> bool:
-    return path == root or root in path.parents
+def _inside_problem(value: str, roots: set[tuple[int, int]]) -> str | None:
+    """None when `value` lies outside every directory whose identity is in `roots`, else
+    why not. No lexical normalization: the path is walked component by component as the
+    operating system would, so `..` after a symbolic link goes where the system takes it and
+    a case-folded spelling on a case-insensitive file system names the same directory."""
+    absolute = value if os.path.isabs(value) else os.getcwd() + os.sep + value
+    parts = [p for p in absolute.split(os.sep) if p not in ("", ".")]
+    prefixes = [os.sep]
+    for part in parts:
+        prefixes.append(os.path.join(prefixes[-1], part))
+    existing = 0
+    while existing + 1 < len(prefixes) and _identity(prefixes[existing + 1]) is not None:
+        existing += 1
+    if existing + 1 < len(prefixes) and os.path.lexists(prefixes[existing + 1]):
+        return "is a symbolic link that does not resolve"
+    if ".." in parts[existing:]:
+        return "has a .. below the part that exists"
+    chain = list(prefixes[: existing + 1])
+    real = os.path.realpath(prefixes[existing])
+    chain.extend(str(p) for p in (Path(real), *Path(real).parents))
+    if any(_identity(p) in roots for p in chain):
+        return "lies inside the repository that holds the lock"
+    return None
 
 
 def host_path_problem(lock_root: Path, paths: Mapping[str, str | Path | None]) -> str | None:
     """None if every named host path (sequencePath, trustedRoot) lies outside the repository
-    that holds the lock, else what is wrong. Both the path as given, made absolute, and its
-    resolved form are checked, against the repository root as given and resolved."""
+    that holds the lock and the lock root, else what is wrong. Inside means that an existing
+    ancestor of the path, as configured or resolved, is the same directory (device and inode)
+    as the repository root or the lock root."""
     repo = repository_root(lock_root)
-    roots = {repo, Path(os.path.abspath(lock_root))}
+    roots = {i for i in (_identity(str(repo)), _identity(str(lock_root))) if i is not None}
     for key, value in paths.items():
         if value is None:
             continue
-        given = Path(os.path.abspath(value))
-        for candidate in (given, _resolved(given)):
-            if any(_within(candidate, root) for root in roots):
-                return f"{key} lies inside the repository that holds the lock ({repo})"
+        why = _inside_problem(str(value), roots)
+        if why is not None:
+            return f"{key} {why} ({repo})"
     return None
 
 

@@ -1,13 +1,13 @@
 # MCP tool lock format, draft 1
 
-Draft 1, revision 1d. Not stable. Files written against it carry lockVersion 1-draft and a
-future version 1 reader rejects them. Revision 1d changes no lock file format. Section 13 lists
-what changed in 1d, and section 14 what changed in 1c.
+Draft 1, revision 1e. Not stable. Files written against it carry lockVersion 1-draft and a
+future version 1 reader rejects them. Revision 1e changes no lock file format. Section 13 lists
+what changed in 1e, section 14 what changed in 1d, and section 15 what changed in 1c.
 
 - Author: Gautam Bharti
 - Date: 2026-10-19
 - Builds on: SEP draft "Client-Held Tool Definition Pinning" (Tool Definition Digest)
-- Test vectors: `vectors/` in this repository, tag `vectors-draft-1d`
+- Test vectors: `vectors/` in this repository, tag `vectors-draft-1e`
 
 ## 1. Scope
 
@@ -390,12 +390,27 @@ host writes its `sequence` to the store when it is higher than the stored value.
 A host refuses, when it loads its configuration, a sequence store file or a trust root file
 that lies inside the repository holding the lock, whether or not a signer is configured.
 Whoever can write to that repository could otherwise replace the trust root or reset the
-floor. The repository is the nearest directory at or above the lock root that has a `.git`
-entry (a directory, or a file as in a git worktree); without one it is the lock root. A path
-is inside when it is that directory or below it. The check is made twice: on the path as
-configured, made absolute, and on its resolved form, with symbolic links followed. For a path
-that does not exist yet, the nearest existing ancestor is resolved and the rest appended. The
-repository directory is compared both as found and resolved.
+floor.
+
+The repository is found by walking up from the lock root, resolved. A `.git` directory ends
+the walk at the directory that holds it. So does a `.git` file whose `gitdir:` line names a
+path under `worktrees` inside a git directory, as a linked worktree's does. Any other `.git`
+file, a submodule's (its gitdir lies under `modules` inside the superproject's git
+directory) or one that names neither, does not end the walk: the walk goes on, and the
+directory holding that file is the repository only when nothing above it has a `.git` entry.
+Without any `.git` entry the repository is the lock root, and only the lock root is
+protected; a host should say so when it reports the check.
+
+A configured path is never normalized lexically. A relative path is made absolute by
+prefixing the directory it is relative to. The host takes the longest leading part of the
+path that exists, as the operating system resolves it (so a `..` after a symbolic link goes
+up from the link's target), and refuses the path when the rest contains a `..` or when the
+part that exists ends in a symbolic link that does not resolve. The path is inside when any
+of these is the same directory as the repository root or the lock root, compared by file
+system identity (device and inode), not by name: each leading part of the path as
+configured, up to the longest that exists, and each ancestor of that part's resolved form.
+Comparing identities makes a case-folded spelling on a case-insensitive file system, and a
+symbolic link followed by `..`, land where the file system puts them.
 
 A failure in steps 1 to 3 is `lock-signature-invalid`, in every posture. A host that supports
 signing as an optional component and finds it absent while an identity is configured fails the
@@ -704,10 +719,12 @@ credentials. Tool names come from the server and are untrusted text; consumers e
 - `frames.json`: section 9.2.2. Each case gives `pending` (the unanswered requests the host
   sent, as `{"id", "method"}`), a `frame` from the server and `expect`: `listing` (checked as
   a page), `handshake` (its instructions are checked), `drop` or `relay`.
-- `host-config.json`: the path rule of section 8.2. Each case lists `dirs` and `files` (empty)
-  and `symlinks` (`path`, `target`) to create in an empty directory outside any repository,
-  the `lockRoot`, and optionally `sequencePath` and `trustedRoot`, all relative to that
-  directory. `expect` is `accept` or `refuse`.
+- `host-config.json`: the path rule of section 8.2. Each case lists `dirs`, `files` (empty),
+  `texts` (`path`, `text`: a file with that content) and `symlinks` (`path`, `target`) to
+  create in an empty directory outside any repository, the `lockRoot`, and optionally
+  `sequencePath` and `trustedRoot`, all relative to that directory. A runner joins those
+  paths to the directory as strings, without normalizing them, since some contain `..`.
+  `expect` is `accept` or `refuse`.
 - `SHA256SUMS`: SHA-256 of every file above, for vendoring.
 
 The vectors include no valid Sigstore bundle. `testVerifier: "accept-any"` tells the test
@@ -716,7 +733,17 @@ checks after verification (the sequence floor, for one). It exists only in test 
 never a host setting. Without it, a signing case expects `lock-signature-invalid` from a
 missing or placeholder bundle.
 
-## 13. Changes in revision 1d
+## 13. Changes in revision 1e
+
+- Section 8.2: the path rule compares file system identities instead of names, never
+  normalizes a configured path lexically, and refuses a `..` in the part that does not exist.
+  A submodule's `.git` file sends the repository walk on to the superproject; a linked
+  worktree's ends it. Vectors: `host-config.json` cases `symlink-then-dotdot`,
+  `dotdot-below-existing`, `submodule-superproject`, `worktree-top` and
+  `git-file-unreadable-continues`.
+- Section 12: host-config cases can create files with content (`texts`).
+
+## 14. Changes in revision 1d
 
 - Section 8.2: a sequence store or trust root inside the repository that holds the lock is
   refused when the host loads its configuration. Vectors: `host-config.json`.
@@ -734,7 +761,7 @@ missing or placeholder bundle.
 - Section 12: `config.json` has `host`; session steps can name request ids, send other
   requests and deliver server frames.
 
-## 14. Changes in revision 1c, from 1b
+## 15. Changes in revision 1c, from 1b
 
 - Section 2.1: a value nested more than 512 levels deep has no digest.
 - Sections 2.3, 5.1 and 9.2.3: an optional `metaDigest` per tool entry approves the top-level

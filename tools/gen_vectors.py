@@ -1772,6 +1772,24 @@ HOST_CASES: list[tuple[str, str, dict[str, Any], str]] = [
      {"dirs": ["repo/.git", "repo/.mcp/lock", "state"], "lockRoot": "repo",
       "symlinks": [{"path": "repo/out", "target": "../state"}], "trustedRoot": "repo/out/trusted_root.json"},
      "refuse"),
+    ("symlink-then-dotdot", "A .. after a symbolic link goes up from the link's target, not from the link.",
+     {"dirs": ["repo/.git", "repo/.mcp/lock", "outside"], "lockRoot": "repo",
+      "symlinks": [{"path": "outside/lnk", "target": "../repo/.mcp"}], "sequencePath": "outside/lnk/../sequence"},
+     "refuse"),
+    ("dotdot-below-existing", "A .. in the part of the path that does not exist yet.",
+     {"dirs": ["repo/.git", "repo/.mcp/lock", "state"], "lockRoot": "repo",
+      "sequencePath": "state/new/../sequence"}, "refuse"),
+    ("submodule-superproject", "A submodule's .git file points under modules/; the superproject holds the lock.",
+     {"dirs": ["super/.git/modules/sm", "super/sm/.mcp/lock", "super/other"],
+      "texts": [{"path": "super/sm/.git", "text": "gitdir: ../.git/modules/sm\n"}], "lockRoot": "super/sm",
+      "sequencePath": "super/other/sequence"}, "refuse"),
+    ("worktree-top", "A linked worktree's .git file points under worktrees/; the worktree is the repository.",
+     {"dirs": ["main/.git/worktrees/wt", "outer/.git", "outer/wt/.mcp/lock", "outer/state"],
+      "texts": [{"path": "outer/wt/.git", "text": "gitdir: ../../main/.git/worktrees/wt\n"}], "lockRoot": "outer/wt",
+      "sequencePath": "outer/state/sequence"}, "accept"),
+    ("git-file-unreadable-continues", "A .git file that names no worktree: the walk goes on to the enclosing repository.",
+     {"dirs": ["outer/.git", "outer/repo/sub/.mcp/lock", "outer/state"], "files": ["outer/repo/.git"],
+      "lockRoot": "outer/repo/sub", "sequencePath": "outer/state/sequence"}, "refuse"),
 ]
 
 
@@ -1781,6 +1799,9 @@ def build_host_layout(case: dict[str, Any], base: Path) -> Path:
     for rel in case.get("files", []):
         (base / rel).parent.mkdir(parents=True, exist_ok=True)
         (base / rel).write_text("", encoding="utf-8")
+    for item in case.get("texts", []):
+        (base / item["path"]).parent.mkdir(parents=True, exist_ok=True)
+        (base / item["path"]).write_text(item["text"], encoding="utf-8")
     for link in case.get("symlinks", []):
         (base / link["path"]).parent.mkdir(parents=True, exist_ok=True)
         (base / link["path"]).symlink_to(link["target"])
