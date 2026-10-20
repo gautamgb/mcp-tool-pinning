@@ -24,8 +24,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from mcp_tool_pinning.digest import canonical_body, instructions_digest, tool_digest
+from mcp_tool_pinning.digest import canonical_body, instructions_digest, meta_digest, tool_digest
 from mcp_tool_pinning.lockref import (
+    classify_frame,
     command_identity,
     identity_h16,
     identity_key,
@@ -98,6 +99,8 @@ class DigestCase:
     has_digest: bool
     same_as: str | None = None
     differs_from: tuple[str, ...] = ()
+    # Kept out of tools.json, whose indented form of a deeply nested value runs to megabytes.
+    raw_only: bool = False
 
 
 TEXT_PROPS = '"properties": {"text": {"type": "string"}}'
@@ -297,6 +300,29 @@ DIGEST_CASES = [
         "What duplicate-key-last-wins parses to.",
         True,
     ),
+    DigestCase(
+        "depth-512-has-digest",
+        tool_text('"x-deep": ' + "[" * 511 + "0" + "]" * 511),
+        "The innermost value sits at depth 512, the deepest that gets a digest.",
+        True,
+        differs_from=("base",),
+        raw_only=True,
+    ),
+    DigestCase(
+        "depth-513-no-digest",
+        tool_text('"x-deep": ' + "[" * 512 + "0" + "]" * 512),
+        "One level deeper than depth-512-has-digest: no digest.",
+        False,
+        raw_only=True,
+    ),
+    DigestCase(
+        "depth-in-top-meta-ignored",
+        tool_text('"_meta": {"x": ' + "[" * 600 + "]" * 600 + "}"),
+        "Deep nesting inside the removed top-level _meta does not affect the digest.",
+        True,
+        same_as="base",
+        raw_only=True,
+    ),
 ]
 
 
@@ -337,6 +363,8 @@ def build_digest(out: Path, legacy_source: Path) -> None:
 
     tools = list(legacy)
     for case in DIGEST_CASES:
+        if case.raw_only:
+            continue
         try:
             tool = strict_parse(case.text)
         except ValueError:
@@ -605,25 +633,43 @@ class Builder:
         if instructions is not None:
             digest = instructions_digest(instructions)
             doc["instructions"] = {"digest": digest}
-        doc["tools"] = {
-            t["name"]: {
-                "digest": "sha256:" + _hex(t),
-                "contract": self.contract(t),
-                "approval": dict(APPROVAL),
-            }
-            for t in tools
-        }
+        doc["tools"] = {t["name"]: self._entry(t) for t in tools}
         if edit is not None:
             edit(doc)
         name = filename or shard_filename(identity)
         self.write(f"{directory}/{name}", dump(doc))
         return name
 
-    def listing(self, tools: list[dict[str, Any]], instructions: str | None = None) -> None:
+    def _entry(self, tool: dict[str, Any]) -> dict[str, Any]:
+        """A tool entry as an approval writer records it: metaDigest when the tool has _meta."""
+        entry: dict[str, Any] = {
+            "digest": "sha256:" + _hex(tool),
+            "contract": self.contract(tool),
+            "approval": dict(APPROVAL),
+        }
+        if "_meta" in tool:
+            digest = meta_digest(tool["_meta"])
+            assert digest is not None, tool["name"]
+            entry["metaDigest"] = digest
+        return entry
+
+    def shard_text(self, identity: dict[str, Any], tools: list[dict[str, Any]]) -> str:
+        """Shard text for a session step to write later. Its contracts are written now."""
+        doc: dict[str, Any] = {"lockVersion": "1-draft", "identity": identity}
+        doc["attributes"] = {"version": "1.4.0", "env": ["DOCS_TOKEN"]}
+        doc["tools"] = {t["name"]: self._entry(t) for t in tools}
+        return dump(doc)
+
+    def listing(
+        self, tools: list[dict[str, Any]], instructions: str | None = None, name: str = "listing.json"
+    ) -> None:
         doc: dict[str, Any] = {"tools": tools}
         if instructions is not None:
             doc["instructions"] = instructions
-        self.write("listing.json", dump(doc))
+        self.write(name, dump(doc))
+
+    def session(self, steps: list[dict[str, Any]]) -> None:
+        self.write("session.json", dump({"steps": steps}))
 
     def server(self, identity: dict[str, Any]) -> None:
         self.write("server.json", dump(identity))
@@ -654,6 +700,7 @@ class Builder:
         strip: bool = False,
         lock_error: str | None = None,
         calls: dict[str, str] | None = None,
+        meta: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         self.expected = {
             "lockError": lock_error,
@@ -664,6 +711,7 @@ class Builder:
             "instructions": instructions,
             "stripInstructions": strip,
             "calls": calls or {},
+            "meta": meta or {},
         }
 
 
@@ -1075,17 +1123,230 @@ SIGNER = {
 }
 
 
+PLACEHOLDER_BUNDLE = dump({"note": "placeholder; not a valid bundle"})
+
+
 def case_signature_missing(b: Builder) -> None:
-    standard(b, signer=SIGNER)
+    standard(b, signer=SIGNER, sequenceStore=True)
     b.manifest()
     lock_failure(b, "lock-signature-invalid")
 
 
-def case_sequence_rollback(b: Builder) -> None:
-    standard(b, signer=SIGNER, lastSequence=5)
-    b.manifest(sequence=3)
-    b.write(".mcp/lock/MANIFEST.json.sigstore", dump({"note": "placeholder; not a valid bundle"}))
+def case_signature_placeholder(b: Builder) -> None:
+    standard(b, signer=SIGNER, sequenceStore=True)
+    b.manifest()
+    b.write(".mcp/lock/MANIFEST.json.sigstore", PLACEHOLDER_BUNDLE)
     lock_failure(b, "lock-signature-invalid")
+
+
+def case_sequence_rollback(b: Builder) -> None:
+    standard(b, signer=SIGNER, sequenceStore=True, lastSequence=5, testVerifier="accept-any")
+    b.manifest(sequence=3)
+    b.write(".mcp/lock/MANIFEST.json.sigstore", PLACEHOLDER_BUNDLE)
+    lock_failure(b, "lock-signature-invalid")
+
+
+def case_signed_ok(b: Builder) -> None:
+    standard(b, signer=SIGNER, sequenceStore=True, lastSequence=5, testVerifier="accept-any")
+    b.manifest(sequence=5)
+    b.write(".mcp/lock/MANIFEST.json.sigstore", PLACEHOLDER_BUNDLE)
+    all_shown(b)
+
+
+def case_signer_without_sequence_store(b: Builder) -> None:
+    standard(b, signer=SIGNER, testVerifier="accept-any")
+    b.manifest(sequence=5)
+    b.write(".mcp/lock/MANIFEST.json.sigstore", PLACEHOLDER_BUNDLE)
+    lock_failure(b, "lock-signature-invalid")
+
+
+# Top-level _meta (section 9.2.3)
+
+META_UI = {"ui": {"resourceUri": "ui://docs/search-app"}}
+META_SWAPPED = {"ui": {"resourceUri": "ui://attacker/app", "visibility": ["model", "app"]}}
+SEARCH_META = {**SEARCH, "_meta": META_UI}
+SEARCH_META_SWAPPED = {**SEARCH, "_meta": META_SWAPPED}
+FETCH_META = {**FETCH, "_meta": {"ui": {"resourceUri": "ui://docs/fetch-app"}}}
+
+
+def case_meta_approved(b: Builder) -> None:
+    b.shard(REMOTE, [SEARCH_META, FETCH_META])
+    b.listing([SEARCH_META, FETCH])
+    b.server(REMOTE)
+    b.config()
+    all_shown(b, meta={"search": {"relay": True, "flag": None}})
+
+
+def case_meta_changed_guard(b: Builder) -> None:
+    b.shard(REMOTE, [SEARCH_META, FETCH])
+    b.listing([SEARCH_META_SWAPPED, FETCH])
+    b.server(REMOTE)
+    b.config()
+    all_shown(b, meta={"search": {"relay": False, "flag": "meta-changed"}})
+
+
+def case_meta_unapproved_guard(b: Builder) -> None:
+    b.shard(REMOTE, [SEARCH, FETCH])
+    b.listing([SEARCH_META, FETCH])
+    b.server(REMOTE)
+    b.config()
+    all_shown(b, meta={"search": {"relay": False, "flag": "meta-unapproved"}})
+
+
+def case_meta_changed_monitor(b: Builder) -> None:
+    b.shard(REMOTE, [SEARCH_META, FETCH])
+    b.listing([SEARCH_META_SWAPPED, FETCH])
+    b.server(REMOTE)
+    b.config("monitor")
+    all_shown(b, meta={"search": {"relay": True, "flag": "meta-changed"}})
+
+
+def case_meta_not_object(b: Builder) -> None:
+    b.shard(REMOTE, [SEARCH_META, FETCH])
+    b.listing([{**SEARCH, "_meta": "ui://docs/search-app"}, FETCH])
+    b.server(REMOTE)
+    b.config()
+    all_shown(b, meta={"search": {"relay": False, "flag": "meta-changed"}})
+
+
+def case_meta_digest_malformed(b: Builder) -> None:
+    b.shard(
+        REMOTE,
+        [SEARCH_META, FETCH],
+        INSTRUCTIONS,
+        edit=lambda d: d["tools"]["search"].update(metaDigest="sha256:" + "0" * 63),
+    )
+    b.listing([SEARCH_META, FETCH], INSTRUCTIONS)
+    b.server(REMOTE)
+    b.config()
+    lock_failure(b, "lock-unreadable")
+
+
+# Sessions (sections 9.2.1, 9.5, 9.8)
+
+
+def call(tool: str, expect: str) -> dict[str, str]:
+    return {"op": "call", "tool": tool, "expect": expect}
+
+
+START = {"op": "list-start"}
+CHANGED = {"op": "list-changed"}
+FAIL = {"op": "list-fail"}
+
+
+def complete(listing: str) -> dict[str, str]:
+    return {"op": "list-complete", "listing": listing}
+
+
+def clock(seconds: int) -> dict[str, Any]:
+    return {"op": "clock", "advance": seconds}
+
+
+def session_base(b: Builder, **config: Any) -> str:
+    """Approved search and fetch; listing-1.json serves both, listing-2.json a changed fetch."""
+    shard = b.shard(REMOTE, [SEARCH, FETCH])
+    b.listing([SEARCH, FETCH], name="listing-1.json")
+    b.listing([SEARCH, FETCH_CHANGED], name="listing-2.json")
+    b.server(REMOTE)
+    b.config(**config)
+    b.expect()
+    return shard
+
+
+def case_session_listing_in_progress(b: Builder) -> None:
+    session_base(b)
+    b.session(
+        [
+            call("search", "no-listing"),
+            START,
+            call("search", "no-listing"),
+            complete("listing-1.json"),
+            call("search", "allow"),
+            call("fetch", "allow"),
+            CHANGED,
+            call("fetch", "allow"),
+            START,
+            call("search", "no-listing"),
+            call("fetch", "no-listing"),
+            CHANGED,
+            call("search", "no-listing"),
+            complete("listing-2.json"),
+            call("search", "allow"),
+            call("fetch", "upstream-changed"),
+            START,
+            START,
+            call("search", "no-listing"),
+            complete("listing-1.json"),
+            call("fetch", "allow"),
+        ]
+    )
+
+
+def case_session_listing_failed(b: Builder) -> None:
+    session_base(b)
+    b.session(
+        [
+            START,
+            complete("listing-1.json"),
+            call("search", "allow"),
+            START,
+            FAIL,
+            call("search", "unreachable"),
+            CHANGED,
+            call("search", "unreachable"),
+            START,
+            call("search", "no-listing"),
+            complete("listing-1.json"),
+            call("search", "allow"),
+        ]
+    )
+
+
+def case_session_stale_reload_shrinks(b: Builder) -> None:
+    shard = session_base(b)
+    revoked = b.shard_text(REMOTE, [SEARCH])
+    restored = b.shard_text(REMOTE, [SEARCH, FETCH])
+    path = f".mcp/lock/{shard}"
+    b.session(
+        [
+            START,
+            complete("listing-1.json"),
+            {"op": "write", "path": path, "text": revoked},
+            clock(59),
+            call("fetch", "allow"),
+            clock(2),
+            call("fetch", "new-tool"),
+            call("search", "allow"),
+            {"op": "write", "path": path, "text": restored},
+            clock(61),
+            call("fetch", "new-tool"),
+            START,
+            complete("listing-1.json"),
+            call("fetch", "allow"),
+        ]
+    )
+
+
+def case_session_stale_reload_fails(b: Builder) -> None:
+    shard = session_base(b, maxStaleness=10)
+    path = f".mcp/lock/{shard}"
+    b.session(
+        [
+            START,
+            complete("listing-1.json"),
+            {"op": "write", "path": path, "text": "{not json\n"},
+            clock(5),
+            call("search", "allow"),
+            clock(6),
+            call("search", "lock-stale"),
+            call("fetch", "lock-stale"),
+            START,
+            complete("listing-1.json"),
+            call("search", "lock-unreadable"),
+            clock(11),
+            call("search", "lock-unreadable"),
+        ]
+    )
 
 
 def case_call_before_listing(b: Builder) -> None:
@@ -1181,9 +1442,49 @@ LOCK_CASES: dict[str, tuple[Callable[[Builder], None], str]] = {
     ),
     "manifest-required-missing": (case_manifest_required_missing, "Host requires a manifest; none present."),
     "signature-missing": (case_signature_missing, "Signer configured; no MANIFEST.json.sigstore."),
+    "signature-placeholder": (case_signature_placeholder, "Signer configured; the bundle is not valid."),
     "sequence-rollback": (
         case_sequence_rollback,
-        "Signer configured; sequence below the last accepted value.",
+        "Signer configured, test verifier accepts; sequence below the last accepted value.",
+    ),
+    "signed-ok": (
+        case_signed_ok,
+        "Signer configured, test verifier accepts; sequence equal to the last accepted value.",
+    ),
+    "signer-without-sequence-store": (
+        case_signer_without_sequence_store,
+        "Signer configured but no sequence store: refused before any bundle is checked.",
+    ),
+    "meta-approved": (
+        case_meta_approved,
+        "Served _meta matches metaDigest and is relayed; a tool approved with _meta may drop it.",
+    ),
+    "meta-changed-guard": (case_meta_changed_guard, "Served _meta differs from metaDigest; guard removes it."),
+    "meta-unapproved-guard": (
+        case_meta_unapproved_guard,
+        "Served _meta, entry has no metaDigest; guard removes it.",
+    ),
+    "meta-changed-monitor": (
+        case_meta_changed_monitor,
+        "Served _meta differs from metaDigest; monitor relays it and flags it.",
+    ),
+    "meta-not-object": (case_meta_not_object, "Served _meta is a string: it has no digest, so it changed."),
+    "meta-digest-malformed": (case_meta_digest_malformed, "A metaDigest that is not a digest."),
+    "session-listing-in-progress": (
+        case_session_listing_in_progress,
+        "Calls during a listing get no-listing; list_changed alone keeps the allow-list.",
+    ),
+    "session-listing-failed": (
+        case_session_listing_failed,
+        "A failed listing refuses calls with unreachable until a listing completes.",
+    ),
+    "session-stale-reload-shrinks": (
+        case_session_stale_reload_shrinks,
+        "Default 60 s staleness: a reload withholds a revoked tool and never restores one.",
+    ),
+    "session-stale-reload-fails": (
+        case_session_stale_reload_fails,
+        "A failed reload is lock-stale; a whole-lock failure on a listing is reported before lock-stale.",
     ),
     "call-before-listing": (case_call_before_listing, "Calls before any listing are refused."),
     "calls": (case_calls, "Calls to an approved, a withheld and an unlisted tool."),
@@ -1204,6 +1505,72 @@ def build_lock(out: Path) -> None:
     (out / "lock" / "index.json").write_text(dump(index), encoding="utf-8")
 
 
+# Frame cases (section 9.2.2)
+
+TOOLS_RESULT = {"tools": [{"name": "evil", "description": "x", "inputSchema": {"type": "object"}}]}
+
+
+def frame(**members: Any) -> dict[str, Any]:
+    return {"jsonrpc": "2.0", **members}
+
+
+# (name, note, inflight ids, handshake id or None, frame, expected)
+FRAME_CASES: list[tuple[str, str, list[Any], Any, Any, str]] = [
+    ("listing-number-id", "Answers an in-flight tools/list.", [1], None, frame(id=1, result=TOOLS_RESULT), "listing"),
+    ("listing-string-id", "String ids match equal strings.", ["a"], None, frame(id="a", result=TOOLS_RESULT),
+     "listing"),
+    ("listing-error", "An error answer to an in-flight tools/list ends that listing.", [1], None,
+     frame(id=1, error={"code": -32603, "message": "x"}), "listing"),
+    ("string-is-not-number", "\"1\" does not answer request 1.", [1], None, frame(id="1", result=TOOLS_RESULT),
+     "drop"),
+    ("number-is-not-string", "1 does not answer request \"1\".", ["1"], None, frame(id=1, result=TOOLS_RESULT),
+     "drop"),
+    ("true-is-not-one", "true does not answer request 1.", [1], None, frame(id=True, result=TOOLS_RESULT), "drop"),
+    ("null-id", "A null id answers nothing, even if the host sent a request with a null id.", [None], None,
+     frame(id=None, result=TOOLS_RESULT), "drop"),
+    ("no-id", "A result without an id.", [1], None, frame(result=TOOLS_RESULT), "drop"),
+    ("unmatched-id", "No tools/list with this id is in flight.", [1], None, frame(id=2, result=TOOLS_RESULT),
+     "drop"),
+    ("method-and-result", "A frame with both method and result is not a response.", [1], None,
+     frame(id=1, method="x", result=TOOLS_RESULT), "drop"),
+    ("method-null-and-result", "A method member, even null, makes it not a response.", [1], None,
+     frame(id=1, method=None, result=TOOLS_RESULT), "drop"),
+    ("inflight-before-handshake", "initialize \"1\" and tools/list 1 in flight; 1 is the listing.", [1], "1",
+     frame(id=1, result=TOOLS_RESULT), "listing"),
+    ("same-id-both", "One id on both: the in-flight tools/list wins.", [7], 7, frame(id=7, result=TOOLS_RESULT),
+     "listing"),
+    ("handshake-exact", "Answers the in-flight initialize.", [], 0,
+     frame(id=0, result={"protocolVersion": "2025-11-25", "instructions": "x"}), "handshake"),
+    ("handshake-with-tools", "An initialize answer that carries tools.", [], 0,
+     frame(id=0, result={"protocolVersion": "2025-11-25", **TOOLS_RESULT}), "drop"),
+    ("handshake-loose", "0 does not answer initialize \"0\"; it carries instructions.", [], "0",
+     frame(id=0, result={"protocolVersion": "2025-11-25", "instructions": "x"}), "drop"),
+    ("false-is-not-zero", "false does not answer initialize 0.", [], 0,
+     frame(id=False, result={"protocolVersion": "2025-11-25", "instructions": "x"}), "drop"),
+    ("other-response", "A response to some other request is relayed.", [1], 0, frame(id=5, result={"content": []}),
+     "relay"),
+    ("notification", "A notification is relayed.", [1], None, frame(method="notifications/tools/list_changed"),
+     "relay"),
+    ("server-request", "A request from the server is relayed.", [1], None,
+     frame(id=1, method="sampling/createMessage", params={}), "relay"),
+    ("batch", "A frame that is not an object.", [1], None, [frame(id=1, result=TOOLS_RESULT)], "drop"),
+]
+
+
+def build_frames(out: Path) -> None:
+    cases = []
+    for name, note, inflight, handshake, body, expect in FRAME_CASES:
+        got = classify_frame(body, inflight, [] if handshake is None else [handshake])
+        if got != expect:
+            raise SystemExit(f"frame case {name}: declared {expect}, reference gives {got}")
+        case: dict[str, Any] = {"name": name, "note": note, "inflight": inflight}
+        if handshake is not None:
+            case["handshake"] = handshake
+        case.update(frame=body, expect=expect)
+        cases.append(case)
+    (out / "frames.json").write_text(dump(cases), encoding="utf-8")
+
+
 def build_sums(out: Path) -> None:
     lines = []
     for path in sorted(p for p in out.rglob("*") if p.is_file() and not p.is_symlink()):
@@ -1217,6 +1584,7 @@ def build(out: Path, legacy_source: Path) -> None:
     build_digest(out, legacy_source)
     build_identity(out)
     build_lock(out)
+    build_frames(out)
     build_sums(out)
 
 

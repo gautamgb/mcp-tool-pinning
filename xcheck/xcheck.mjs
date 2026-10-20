@@ -3,6 +3,7 @@
 //   vectors/digest/*.json   raw text, through JSON.parse
 //   vectors/identity.json   identity key and h16
 //   vectors/lock/*/.mcp/contracts/*.json  contract bytes are already in RFC 8785 form
+//   vectors/lock/*/                       metaDigest of each _meta the case expects relayed as approved
 import { readFileSync, readdirSync, existsSync } from "node:fs";
 import { createHash } from "node:crypto";
 import canonicalize from "canonicalize";
@@ -28,11 +29,25 @@ const wellFormed = (v) =>
     ? Object.keys(v).every((k) => !LONE.test(k)) && Object.values(v).every(wellFormed)
   : true;
 
+// No digest if any value sits deeper than 512, the tool object being depth 0.
+const MAX_DEPTH = 512;
+const shallow = (v, depth) =>
+  depth > MAX_DEPTH ? false
+  : Array.isArray(v) ? v.every((x) => shallow(x, depth + 1))
+  : v !== null && typeof v === "object" ? Object.values(v).every((x) => shallow(x, depth + 1))
+  : true;
+
 const digest = (tool) => {
   const { _meta, ...body } = tool;
-  if (!wellFormed(body) || !inRange(body)) return null;
+  if (!shallow(body, 0) || !wellFormed(body) || !inRange(body)) return null;
   return "sha256:" + sha256(canonicalize(body));
 };
+
+const metaDigest = (meta) =>
+  meta === null || typeof meta !== "object" || Array.isArray(meta) || !shallow(meta, 1)
+    || !wellFormed(meta) || !inRange(meta)
+    ? null
+    : "sha256:" + sha256(canonicalize(meta));
 
 let total = 0;
 let failed = 0;
@@ -70,6 +85,22 @@ for (const name of readdirSync(new URL("lock/", vectors)).sort()) {
   for (const file of readdirSync(dir).sort()) {
     const text = readFileSync(new URL(file, dir)).toString("utf8");
     report(canonicalize(JSON.parse(text)) === text, `contract ${name}/${file.slice(0, 19)}`, "jcs");
+  }
+}
+
+for (const name of readdirSync(new URL("lock/", vectors)).sort()) {
+  const base = `lock/${name}/`;
+  if (!existsSync(new URL(`${base}expected.json`, vectors))) continue;
+  const expected = JSON.parse(read(`${base}expected.json`));
+  const approved = Object.entries(expected.meta).filter(([, m]) => m.flag === null);
+  if (approved.length === 0) continue;
+  const listing = JSON.parse(read(`${base}listing.json`));
+  const shards = readdirSync(new URL(`${base}.mcp/lock/`, vectors)).filter((f) => /--[0-9a-f]{16}\.json$/.test(f));
+  const entries = Object.assign({}, ...shards.map((f) => JSON.parse(read(`${base}.mcp/lock/${f}`)).tools));
+  for (const [tool] of approved) {
+    const served = listing.tools.find((t) => t.name === tool);
+    const js = metaDigest(served._meta);
+    report(js === entries[tool].metaDigest, `metaDigest ${name}/${tool}`, js ?? "no digest");
   }
 }
 

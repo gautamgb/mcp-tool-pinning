@@ -1,8 +1,8 @@
-"""Reference checker for the lock format, draft 1 (spec/mcp-lock-draft-1.md).
+"""Reference checker for the lock format, draft 1c (spec/mcp-lock-draft-1.md).
 
-It exists to pin the spec down against the vectors in vectors/lock/. It reads a
-lock, checks one listing against it and decides calls. It does not write locks,
-verify Sigstore bundles or emit events; a host does those.
+It exists to pin the spec down against the vectors in vectors/. It reads a lock, checks
+listings against it, decides calls, classifies upstream frames and runs the session steps of
+section 12. It does not write locks, verify Sigstore bundles or emit events; a host does those.
 """
 
 from __future__ import annotations
@@ -21,13 +21,16 @@ from urllib.parse import urlsplit
 
 import rfc8785
 
-from mcp_tool_pinning.digest import instructions_digest, tool_digest
+from mcp_tool_pinning.digest import instructions_digest, meta_digest, tool_digest
 
 LOCK_VERSION = "1-draft"
 REFUSAL_CODE = -32011
 POSTURES = ("monitor", "guard", "strict")
 REGISTRIES = ("npm", "pypi", "oci")
 DEFAULT_PORTS = {"http": 80, "https": 443}
+DEFAULT_MAX_STALENESS = 60.0
+META_CHANGED = "meta-changed"
+META_UNAPPROVED = "meta-unapproved"
 
 # Section 4.4: every pattern is ASCII-only and matched with fullmatch. `\d` would accept other
 # scripts' digits and `$` would accept a trailing newline, so neither is used.
@@ -69,6 +72,7 @@ ALIASES = "aliases.json"
 SHARD_KEYS = {"lockVersion", "identity", "attributes", "instructions", "tools"}
 ATTRIBUTE_KEYS = {"version", "audience", "command", "args", "env"}
 ENTRY_KEYS = {"digest", "contract", "approval"}
+ENTRY_OPTIONAL = {"metaDigest"}
 APPROVAL_KEYS = {"subject", "at", "via", "ref"}
 VIA = {"pr", "runtime", "api", "migrated"}
 
@@ -275,6 +279,8 @@ class Shard:
     identity: dict[str, Any]
     tools: dict[str, str]
     instructions: str | None
+    # Tool name -> approved metaDigest, for the entries that carry one.
+    meta: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -290,6 +296,9 @@ class ReaderConfig:
 
     require_manifest: bool = False
     signer: Mapping[str, Any] | None = None
+    # Section 8.2: a host with a signer must name a sequence store. The vectors model the
+    # store as present or absent; `last_sequence` is the value it holds.
+    sequence_store: bool = False
     last_sequence: int | None = None
     verify_signature: Callable[[bytes, bytes, Mapping[str, Any]], bool] | None = None
 
@@ -358,6 +367,8 @@ def _read_lock_dir(lock_dir: Path) -> dict[str, bytes]:
 
 def _check_manifest(files: dict[str, bytes], config: ReaderConfig) -> int | None:
     signed = config.signer is not None
+    if signed and not config.sequence_store:
+        raise LockError("lock-signature-invalid", "signer configured without a sequence store")
     if MANIFEST not in files:
         if signed:
             raise LockError("lock-signature-invalid", "signer configured but no MANIFEST.json")
@@ -423,12 +434,12 @@ def _check_attributes(attributes: Any) -> None:
         raise _unreadable("attributes.env holds names only")
 
 
-def _check_entry(name: str, entry: Any, contracts: Path) -> str:
+def _check_entry(name: str, entry: Any, contracts: Path) -> tuple[str, str | None]:
     if not isinstance(entry, dict):
         raise _unreadable(f"tool {name!r} entry is not an object")
-    if set(entry) - ENTRY_KEYS:
+    if set(entry) - ENTRY_KEYS - ENTRY_OPTIONAL:
         raise _unsupported(f"tool {name!r} members {sorted(entry)}")
-    if set(entry) != ENTRY_KEYS:
+    if set(entry) & ENTRY_KEYS != ENTRY_KEYS:
         raise _unreadable(f"tool {name!r} lacks {sorted(ENTRY_KEYS - set(entry))}")
     approval = entry["approval"]
     if not isinstance(approval, dict):
@@ -456,7 +467,10 @@ def _check_entry(name: str, entry: Any, contracts: Path) -> str:
         raise LockError("contract-mismatch", f"tool {name!r} contract file missing") from None
     if hashlib.sha256(data).hexdigest() != match.group(1):
         raise LockError("contract-mismatch", f"tool {name!r} contract bytes differ from digest")
-    return digest
+    meta = entry.get("metaDigest")
+    if "metaDigest" in entry and not (isinstance(meta, str) and DIGEST.fullmatch(meta)):
+        raise _unreadable(f"tool {name!r} metaDigest malformed")
+    return digest, meta
 
 
 def _check_shard(filename: str, raw: bytes, contracts: Path) -> Shard:
@@ -491,8 +505,13 @@ def _check_shard(filename: str, raw: bytes, contracts: Path) -> Shard:
     tools = doc["tools"]
     if not isinstance(tools, dict):
         raise _unreadable(f"{filename} tools is not an object")
-    approved = {name: _check_entry(name, entry, contracts) for name, entry in tools.items()}
-    return Shard(identity=identity, tools=approved, instructions=instructions)
+    entries = {name: _check_entry(name, entry, contracts) for name, entry in tools.items()}
+    return Shard(
+        identity=identity,
+        tools={name: digest for name, (digest, _) in entries.items()},
+        instructions=instructions,
+        meta={name: meta for name, (_, meta) in entries.items() if meta is not None},
+    )
 
 
 def load_lock(root: Path, config: ReaderConfig | None = None) -> Lock:
@@ -534,6 +553,9 @@ class Decision:
     strip_instructions: bool = False
     lock_error: str | None = None
     callable: set[str] = field(default_factory=set)
+    # Section 9.2.3, for each shown tool that has a top-level _meta: whether the host relays
+    # it, and the flag (meta-changed, meta-unapproved or None).
+    meta: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 def check_listing(
@@ -587,6 +609,15 @@ def check_listing(
             decision.flagged[name] = reason
         decision.shown.append(name)
         decision.callable.add(name)
+        if "_meta" in tool:
+            approved_meta = shard.meta.get(name) if shard is not None else None
+            if approved_meta is None:
+                flag: str | None = META_UNAPPROVED
+            elif meta_digest(tool["_meta"]) != approved_meta:
+                flag = META_CHANGED
+            else:
+                flag = None
+            decision.meta[name] = {"relay": flag is None or not guard, "flag": flag}
 
     if shard is not None:
         decision.removed = sorted(set(shard.tools) - set(counts))
@@ -608,3 +639,151 @@ def check_call(decision: Decision | None, name: str) -> str:
     if name in decision.callable:
         return "allow"
     return decision.withheld.get(name, "not-listed")
+
+
+# Upstream frames (section 9.2.2)
+
+
+def _id_matches(rid: Any, ids: Sequence[Any]) -> bool:
+    """Exact JSON type and value: a string matches only an equal string, a number only an
+    equal number. Booleans, null, objects and arrays never match, so `true` is not 1 and
+    `"1"` is not 1."""
+    if isinstance(rid, str):
+        return any(isinstance(i, str) and i == rid for i in ids)
+    if isinstance(rid, (int, float)) and not isinstance(rid, bool):
+        return any(isinstance(i, (int, float)) and not isinstance(i, bool) and i == rid for i in ids)
+    return False
+
+
+def classify_frame(frame: Any, inflight: Sequence[Any], handshake: Sequence[Any] = ()) -> str:
+    """What a host does with one frame from the server.
+
+    `inflight` holds the ids of the host's tools/list requests still unanswered, `handshake`
+    the id of its initialize request if that is unanswered. Returns `listing` (check it as a
+    page of a listing), `handshake` (check its instructions), `drop` (never reaches the
+    client) or `relay` (pass it on unchanged).
+    """
+    if not isinstance(frame, dict):
+        return "drop"
+    result = frame.get("result")
+    carries_tools = isinstance(result, dict) and "tools" in result
+    carries_instructions = isinstance(result, dict) and "instructions" in result
+    if "method" in frame:
+        return "drop" if "result" in frame or "error" in frame else "relay"
+    if "id" not in frame:
+        return "drop" if carries_tools or carries_instructions else "relay"
+    rid = frame["id"]
+    if _id_matches(rid, inflight):
+        return "listing"
+    if carries_tools:
+        return "drop"
+    if _id_matches(rid, handshake):
+        return "handshake"
+    if carries_instructions:
+        return "drop"
+    return "relay"
+
+
+# Sessions (sections 9.2.1, 9.5 and 9.8)
+
+
+class Session:
+    """One connection's call gate, driven by the steps of a session.json vector.
+
+    The lock is loaded for every listing. A call made while a listing is in progress gets
+    no-listing. A call checked against a snapshot older than `max_staleness` seconds reloads
+    the lock first; the reload re-checks the latest listing and can only remove names from the
+    allow-list, and a failed reload refuses the call with lock-stale.
+    """
+
+    def __init__(
+        self,
+        root: Path,
+        identity: Mapping[str, Any],
+        posture: str,
+        config: ReaderConfig,
+        max_staleness: float = DEFAULT_MAX_STALENESS,
+    ) -> None:
+        self.root = root
+        self.identity = identity
+        self.posture = posture
+        self.config = config
+        self.max_staleness = max_staleness
+        self.now = 0.0
+        self.decision: Decision | None = None
+        self.loaded_at = 0.0
+        self.listing: Mapping[str, Any] | None = None
+        self.in_progress = False
+        self.failed = False
+        self.due = False
+
+    def _load(self) -> Lock | LockError:
+        try:
+            return load_lock(self.root, self.config)
+        except LockError as exc:
+            return exc
+
+    def list_start(self) -> None:
+        self.in_progress = True
+
+    def list_complete(self, listing: Mapping[str, Any]) -> None:
+        self.decision = check_listing(self._load(), self.identity, listing, self.posture)
+        self.listing = listing
+        self.loaded_at = self.now
+        self.in_progress = self.failed = self.due = False
+
+    def list_fail(self) -> None:
+        self.in_progress = False
+        self.failed = True
+        self.decision = None
+        self.listing = None
+
+    def list_changed(self) -> None:
+        self.due = True
+
+    def call(self, name: str) -> str:
+        if self.in_progress:
+            return "no-listing"
+        if self.failed:
+            return "unreachable"
+        decision = self.decision
+        if decision is None or self.listing is None:
+            return "no-listing"
+        if decision.lock_error is not None:
+            return decision.lock_error
+        if self.now - self.loaded_at > self.max_staleness:
+            lock = self._load()
+            if isinstance(lock, LockError):
+                return "lock-stale"
+            fresh = check_listing(lock, self.identity, self.listing, self.posture)
+            for dropped in decision.callable - fresh.callable:
+                decision.withheld[dropped] = fresh.withheld.get(dropped, "not-listed")
+            decision.callable &= fresh.callable
+            self.loaded_at = self.now
+        return check_call(decision, name)
+
+
+def run_session(root: Path, steps: Sequence[Mapping[str, Any]], session: Session) -> list[str]:
+    """Run session.json steps. Returns a description of every call whose verdict differs."""
+    mismatches: list[str] = []
+    for index, step in enumerate(steps):
+        op = step["op"]
+        if op == "list-start":
+            session.list_start()
+        elif op == "list-complete":
+            session.list_complete(json.loads((root / step["listing"]).read_text(encoding="utf-8")))
+        elif op == "list-fail":
+            session.list_fail()
+        elif op == "list-changed":
+            session.list_changed()
+        elif op == "clock":
+            session.now += float(step["advance"])
+        elif op == "write":
+            (root / step["path"]).write_bytes(step["text"].encode("utf-8"))
+        elif op == "call":
+            got = session.call(step["tool"])
+            if got != step["expect"]:
+                mismatches.append(f"step {index}: call {step['tool']!r} gave {got!r}, expected {step['expect']!r}")
+        else:
+            raise ValueError(f"unknown session op {op!r}")
+    return mismatches

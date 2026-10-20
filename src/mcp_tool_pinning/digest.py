@@ -21,35 +21,56 @@ PREFIX = "sha256:"
 # same answer as one that keeps them exact.
 NUMBER_LIMIT = 2**53
 
-
-def _numbers_in_range(value: Any) -> bool:
-    if isinstance(value, bool) or value is None or isinstance(value, str):
-        return True
-    if isinstance(value, int):
-        return abs(value) < NUMBER_LIMIT
-    if isinstance(value, float):
-        return math.isfinite(value) and abs(value) < NUMBER_LIMIT
-    if isinstance(value, Mapping):
-        return all(_numbers_in_range(v) for v in value.values())
-    if isinstance(value, list):
-        return all(_numbers_in_range(v) for v in value)
-    return False
+# A value nested deeper than this gets no digest (lock draft 1c, section 2.1). The tool object
+# is at depth 0 and each member value or array element is one deeper than its container. The
+# limit keeps every implementation clear of its recursion limit and gives them one answer.
+MAX_DEPTH = 512
 
 
-def _well_formed(value: Any) -> bool:
-    """False if any key or string holds a UTF-16 surrogate code point.
+def _lone_surrogate(text: str) -> bool:
+    """True if the str holds a UTF-16 surrogate code point.
 
-    `json.loads` joins a valid escaped pair into one code point above U+FFFF,
-    so a surrogate left in a Python str is always unpaired. RFC 8785 serializes to UTF-8, which cannot
-    encode one. Checked here so the rule does not depend on which exception the
-    canonicalization library raises.
+    `json.loads` joins a valid escaped pair into one code point above U+FFFF, so a surrogate
+    left in a Python str is always unpaired. RFC 8785 serializes to UTF-8, which cannot encode
+    one. Checked here so the rule does not depend on which exception the canonicalization
+    library raises.
     """
-    if isinstance(value, str):
-        return not any("\ud800" <= ch <= "\udfff" for ch in value)
-    if isinstance(value, Mapping):
-        return all(_well_formed(k) and _well_formed(v) for k, v in value.items())
-    if isinstance(value, list):
-        return all(_well_formed(v) for v in value)
+    return any("\ud800" <= ch <= "\udfff" for ch in text)
+
+
+def _digestible(value: Any, depth: int) -> bool:
+    """False if anything in `value` (which sits at `depth`) rules out a digest: a number out of
+    range or not finite, a lone surrogate in a member name or string, a value deeper than
+    MAX_DEPTH, or something that is not JSON.
+
+    Iterative, so a hostile listing cannot reach the interpreter's recursion limit here, and
+    the depth test comes first, so rfc8785 never sees a value deep enough to exhaust it.
+    """
+    stack = [(value, depth)]
+    while stack:
+        item, level = stack.pop()
+        if level > MAX_DEPTH:
+            return False
+        if isinstance(item, bool) or item is None:
+            continue
+        if isinstance(item, str):
+            if _lone_surrogate(item):
+                return False
+        elif isinstance(item, int):
+            if abs(item) >= NUMBER_LIMIT:
+                return False
+        elif isinstance(item, float):
+            if not (math.isfinite(item) and abs(item) < NUMBER_LIMIT):
+                return False
+        elif isinstance(item, Mapping):
+            for key, member in item.items():
+                if not isinstance(key, str) or _lone_surrogate(key):
+                    return False
+                stack.append((member, level + 1))
+        elif isinstance(item, list):
+            stack.extend((member, level + 1) for member in item)
+        else:
+            return False
     return True
 
 
@@ -64,7 +85,7 @@ def tool_digest(tool: Mapping[str, Any]) -> str | None:
     treats the tool as unapproved.
     """
     body = {k: v for k, v in tool.items() if k != "_meta"}
-    if not (_well_formed(body) and _numbers_in_range(body)):
+    if not _digestible(body, 0):
         return None
     try:
         return _sha256(rfc8785.dumps(body))
@@ -82,9 +103,25 @@ def canonical_body(tool: Mapping[str, Any]) -> bytes | None:
     return rfc8785.dumps({k: v for k, v in tool.items() if k != "_meta"})
 
 
+def meta_digest(meta: Any) -> str | None:
+    """Digest of a tool's top-level `_meta` object (lock draft 1c, section 2.3), or None.
+
+    The rules of the tool digest apply, with `_meta` at depth 1 as it sits in the tool. A
+    `_meta` that is not an object has no digest.
+    """
+    if not isinstance(meta, Mapping):
+        return None
+    if not _digestible(meta, 1):
+        return None
+    try:
+        return _sha256(rfc8785.dumps(dict(meta)))
+    except (rfc8785.CanonicalizationError, UnicodeEncodeError):
+        return None
+
+
 def instructions_digest(instructions: str) -> str | None:
     """SHA-256 over the RFC 8785 form of the instructions as a JSON string."""
-    if not _well_formed(instructions):
+    if _lone_surrogate(instructions):
         return None
     return _sha256(rfc8785.dumps(instructions))
 
