@@ -1,12 +1,13 @@
-# MCP tool lock format, draft 1c
+# MCP tool lock format, draft 1
 
-Draft 1c. Not stable. Files written against it carry lockVersion 1-draft and a future version 1
-reader rejects them. Section 13 lists what changed from draft 1b.
+Draft 1, revision 1d. Not stable. Files written against it carry lockVersion 1-draft and a
+future version 1 reader rejects them. Revision 1d changes no lock file format. Section 13 lists
+what changed in 1d, and section 14 what changed in 1c.
 
 - Author: Gautam Bharti
 - Date: 2026-10-19
 - Builds on: SEP draft "Client-Held Tool Definition Pinning" (Tool Definition Digest)
-- Test vectors: `vectors/` in this repository, tag `vectors-draft-1c`
+- Test vectors: `vectors/` in this repository, tag `vectors-draft-1d`
 
 ## 1. Scope
 
@@ -386,6 +387,16 @@ A reader keeps the floor in memory for each store it reads, so a sequence store 
 deleted or rewritten while the host runs does not lower it. After accepting a manifest, the
 host writes its `sequence` to the store when it is higher than the stored value.
 
+A host refuses, when it loads its configuration, a sequence store file or a trust root file
+that lies inside the repository holding the lock, whether or not a signer is configured.
+Whoever can write to that repository could otherwise replace the trust root or reset the
+floor. The repository is the nearest directory at or above the lock root that has a `.git`
+entry (a directory, or a file as in a git worktree); without one it is the lock root. A path
+is inside when it is that directory or below it. The check is made twice: on the path as
+configured, made absolute, and on its resolved form, with symbolic links followed. For a path
+that does not exist yet, the nearest existing ancestor is resolved and the rest appended. The
+repository directory is compared both as found and resolved.
+
 A failure in steps 1 to 3 is `lock-signature-invalid`, in every posture. A host that supports
 signing as an optional component and finds it absent while an identity is configured fails the
 same way. A host without a configured identity does not verify and MUST NOT describe the lock
@@ -446,7 +457,9 @@ carry tools to the model. The host matches a response to a request by `id`, comp
 type and value exactly: a string matches only an equal string, and a number only an equal
 number. `"1"` does not match `1`, `true` does not match `1`, and `null` matches nothing, so a
 `tools/list` sent with a null id never receives a listing. Unanswered `tools/list` requests
-are matched first, and the host's unanswered `initialize` request second.
+are matched first, and the host's unanswered handshake requests second. A handshake request is
+`initialize` or `server/discover`; the response to either may carry instructions, and both are
+checked as in section 9.3.
 
 The host drops a frame from the server, and reports it, when the frame:
 
@@ -456,10 +469,14 @@ The host drops a frame from the server, and reports it, when the frame:
   request. This includes a frame with no `id` or a null `id`, an `id` that matches nothing,
   and a match to `initialize`;
 - has a `result` object with an `instructions` member and matches neither an unanswered
-  `tools/list` request nor the unanswered `initialize` request.
+  `tools/list` request nor an unanswered handshake request.
 
-When a dropped frame matches a request the client is waiting on, the host answers that request
-with a JSON-RPC error so the client is not left waiting.
+When a dropped frame has an `id` that matches an unanswered request the host sent, by the same
+exact rule, the host ends that request: it answers its own client with a JSON-RPC error that
+carries the id the client used, and stops waiting for a response from the server. A later
+frame with that id matches nothing. If the request was a `tools/list` of the listing in
+progress, a first page or a later one, that listing fails (section 9.5). A dropped frame
+without such an `id` changes no request and no listing.
 
 ### 9.2.3 Top-level `_meta`
 
@@ -504,13 +521,19 @@ gets a JSON-RPC error and is not sent to the server:
 
 `data.reason` is the first of these that applies:
 
-1. `no-listing`, when a listing is in progress (section 9.2.1) or none has completed on this
-   connection;
-2. the lock failure, when the latest listing was decided under section 9.4;
+1. `no-listing`, when a listing is in progress (section 9.2.1), or when no listing has ended on
+   this connection, by completing or by failing;
+2. the lock failure, when the latest listing that completed on this connection was decided
+   under section 9.4. A later failed listing does not change this: a failed listing loads no
+   lock, and section 9.4 holds until a load succeeds;
 3. `unreachable`, when the latest listing on this connection failed;
 4. `lock-stale`, under section 9.8;
 5. the tool's reason from section 9.2, when the name was withheld;
 6. `not-listed`, when the name was not in the latest listing.
+
+So a connection whose first listing fails refuses calls with `unreachable`, and one whose last
+completed listing met a broken lock refuses them with the lock failure even after a later
+listing fails.
 
 A listing fails when the server answers `tools/list` with an error, sends a result without a
 `tools` array, cannot be asked for a further page, or exceeds a limit the host sets on pages or
@@ -579,13 +602,22 @@ A host records decisions as JSON objects, one per line. Every event has:
 
 By type:
 
-- `listing`, one per checked listing: `posture`, `lockError` (code or null), `counts`
-  (`served`, `shown`, `withheld`, `removed`), `tools` (array of `{"name", "served", "approved",
-  "decision", "reason", "meta"}`, where `served` and `approved` are digests or null,
-  `decision` is `shown` or `withheld`, `reason` is a code or null, and `meta` is
-  `meta-changed`, `meta-unapproved` or null), `removed` (names) and `instructions` (code or
-  null). It MAY carry `snapshotId`, a string naming the store snapshot the decision
-  used; its form is up to the store.
+- `listing`, one per checked listing: `posture`, `lockError` (code or null), `counts`,
+  `tools`, `removed` and `instructions`. It MAY carry `snapshotId`, a string naming the store
+  snapshot the decision used; its form is up to the store.
+  - `counts.served` is the length of the listing's `tools` array, `shown` the number of
+    entries shown, `withheld` the difference (entries without a string `name` count as
+    withheld), and `removed` the length of `removed`.
+  - `tools` has one row per listing entry with a string `name`, in listing order, so a
+    repeated name has a row per copy: `{"name", "served", "approved", "decision", "reason",
+    "meta"}`. `served` is the entry's tool digest or null. `approved` is the digest in the
+    shard entry of that name, or null when there is none or the lock failed. `decision` is
+    `shown` or `withheld`. `reason` is the section 9.2 reason or the lock failure, also for a
+    tool shown under `monitor`, or null. `meta` is the section 9.2.3 flag of a shown tool, or
+    null.
+  - `removed` is the names of section 9.2, sorted by code point; empty when the lock failed.
+  - `instructions` is `instructions-changed` or null. It is null when the lock failed: the
+    instructions are then withheld with everything else and `lockError` says why.
 - `refusal`: `tool`, `reason`.
 - `approval`: `tool`, `digest`, `via`, `subject`, `ref`.
 - `override`: `posture`, `until`, `subject`, `ref`. The override record itself is not part of
@@ -643,27 +675,39 @@ credentials. Tool names come from the server and are untrusted text; consumers e
   `server.json` (the identity), `config.json`, `expected.json` and, where needed,
   `setup.json`, which lists symlinks and files the test runner creates before running the
   case, and `session.json`.
-- `config.json` has `posture`, and optionally `requireManifest`, `signer`, `sequenceStore`
-  (true when the host has a sequence store), `lastSequence` (the value in it), `maxStaleness`
-  (seconds, default 60) and `testVerifier`.
+- `config.json` has `posture`, `host` (the host name events carry), and optionally
+  `requireManifest`, `signer`, `sequenceStore` (true when the host has a sequence store),
+  `lastSequence` (the value in it), `maxStaleness` (seconds, default 60) and `testVerifier`.
 - `expected.json` has `lockError`, `shown` (names in listing order), `withheld` and `flagged`
   (name to reason, for guard and monitor respectively), `removed`, `instructions`,
   `stripInstructions`, `calls` (name to `allow` or a reason) and `meta` (for each shown tool
   with a top-level `_meta`, `{"relay": true or false, "flag": "meta-changed",
-  "meta-unapproved" or null}`).
+  "meta-unapproved" or null}`) and `event`: the listing event of section 10 without `id`,
+  `time` and `snapshotId`, or null when the case has no listing. Runners compare every member
+  of it.
 - `session.json`, when present, has `steps`: an array run in order against one connection
-  whose clock starts at 0. `{"op": "list-start"}` starts a listing; `{"op": "list-complete",
-  "listing": "<file>"}` completes it with that file's result, loading the lock for it;
-  `{"op": "list-fail"}` fails it; `{"op": "list-changed"}` is a
-  `notifications/tools/list_changed`; `{"op": "clock", "advance": <seconds>}` moves the clock;
-  `{"op": "write", "path": "<path>", "text": "<text>"}` replaces a file under the case
-  directory; and `{"op": "call", "tool": "<name>", "expect": "<allow or reason>"}` is a call
-  whose verdict must equal `expect`. The cases assume a host that reloads exactly when the
-  snapshot is older than the maximum staleness, no sooner.
-- `frames.json`: section 9.2.2. Each case gives `inflight` (ids of unanswered `tools/list`
-  requests), optionally `handshake` (the id of the unanswered `initialize`), a `frame` from
-  the server and `expect`: `listing` (checked as a page), `handshake` (its instructions are
-  checked), `drop` or `relay`.
+  whose clock starts at 0. `{"op": "list-start"}` sends a cursorless `tools/list` and starts
+  a listing; an `id` member, when present, is the id that request uses, and otherwise the
+  runner picks one that no step uses. `{"op": "list-complete", "listing": "<file>"}` answers
+  the listing's request with that file's tools, loading the lock for it; `{"op":
+  "list-fail"}` answers it with an error; `{"op": "list-changed"}` is a
+  `notifications/tools/list_changed`; `{"op": "request", "id": <id>, "method": "<method>"}`
+  sends some other request, left unanswered; `{"op": "frame", "frame": <frame>, "expect":
+  "<kind>", "errorTo": <id or null>}` is a frame from the server, whose kind (as in
+  `frames.json`) must equal `expect`, and `errorTo` is the id of the request the host answers
+  with a JSON-RPC error because of it (section 9.2.2), or null when it answers none; `{"op":
+  "clock", "advance": <seconds>}` moves the clock; `{"op": "write", "path": "<path>", "text":
+  "<text>"}` replaces a file under the case directory; and `{"op": "call", "tool": "<name>",
+  "expect": "<allow or reason>"}` is a call whose verdict must equal `expect`. The cases
+  assume a host that reloads exactly when the snapshot is older than the maximum staleness,
+  no sooner.
+- `frames.json`: section 9.2.2. Each case gives `pending` (the unanswered requests the host
+  sent, as `{"id", "method"}`), a `frame` from the server and `expect`: `listing` (checked as
+  a page), `handshake` (its instructions are checked), `drop` or `relay`.
+- `host-config.json`: the path rule of section 8.2. Each case lists `dirs` and `files` (empty)
+  and `symlinks` (`path`, `target`) to create in an empty directory outside any repository,
+  the `lockRoot`, and optionally `sequencePath` and `trustedRoot`, all relative to that
+  directory. `expect` is `accept` or `refuse`.
 - `SHA256SUMS`: SHA-256 of every file above, for vendoring.
 
 The vectors include no valid Sigstore bundle. `testVerifier: "accept-any"` tells the test
@@ -672,7 +716,25 @@ checks after verification (the sequence floor, for one). It exists only in test 
 never a host setting. Without it, a signing case expects `lock-signature-invalid` from a
 missing or placeholder bundle.
 
-## 13. Changes from draft 1b
+## 13. Changes in revision 1d
+
+- Section 8.2: a sequence store or trust root inside the repository that holds the lock is
+  refused when the host loads its configuration. Vectors: `host-config.json`.
+- Section 9.2.2: `server/discover` is a handshake request, like `initialize`; its response
+  may carry instructions. `frames.json` cases now give `pending` requests with their methods
+  instead of `inflight` and `handshake`.
+- Section 9.2.2: a dropped frame that matches a pending request ends it with an error to the
+  client, under the client's id, and fails the listing it was part of. Vector:
+  `lock/session-dropped-answer`.
+- Section 9.5: the call reason order is spelled out for a failed first listing and for a
+  failed listing after one decided under section 9.4. Vector:
+  `lock/session-lock-broken-listing-fails`.
+- Section 10: the listing event's counts, rows and `instructions` under a lock failure are
+  defined. Every lock vector with a listing carries its expected event.
+- Section 12: `config.json` has `host`; session steps can name request ids, send other
+  requests and deliver server frames.
+
+## 14. Changes in revision 1c, from 1b
 
 - Section 2.1: a value nested more than 512 levels deep has no digest.
 - Sections 2.3, 5.1 and 9.2.3: an optional `metaDigest` per tool entry approves the top-level
