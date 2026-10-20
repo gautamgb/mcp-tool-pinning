@@ -54,15 +54,16 @@ not stable; files written against it carry `lockVersion: "1-draft"`.
 
 `vectors/` holds the cases a Python and a TypeScript implementation are both tested against:
 parsed and raw-text digest cases, identity normalization, the classification of frames from
-a server, and one directory per lock case with its expected outcome and, for some, a session of
-listings and calls. `src/mcp_tool_pinning/lockref.py` is a small reference checker
+a server, the host configuration path rule, and one directory per lock case with its expected
+decisions and listing event and, for some, a session of listings, server frames and calls. `src/mcp_tool_pinning/lockref.py` is a small reference checker
 that passes them. Nothing in `vectors/` is edited by hand:
 
     uv run python tools/gen_vectors.py          # rebuild vectors/
     uv run python tools/gen_vectors.py --check  # fail if vectors/ is stale
 
 `vectors/SHA256SUMS` covers every file under `vectors/`, for vendoring. The xcheck script
-also runs the raw-text cases and contract files through JavaScript.
+also runs the raw-text cases, contract files and the served digests in each expected listing
+event through JavaScript.
 
 ## Design notes
 
