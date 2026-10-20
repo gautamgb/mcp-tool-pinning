@@ -4,6 +4,7 @@
 //   vectors/identity.json   identity key and h16
 //   vectors/lock/*/.mcp/contracts/*.json  contract bytes are already in RFC 8785 form
 //   vectors/lock/*/                       metaDigest of each _meta the case expects relayed as approved
+//   vectors/lock/*/expected.json          the served digest of each tool row in the listing event
 import { readFileSync, readdirSync, existsSync } from "node:fs";
 import { createHash } from "node:crypto";
 import canonicalize from "canonicalize";
@@ -102,6 +103,18 @@ for (const name of readdirSync(new URL("lock/", vectors)).sort()) {
     const js = metaDigest(served._meta);
     report(js === entries[tool].metaDigest, `metaDigest ${name}/${tool}`, js ?? "no digest");
   }
+}
+
+for (const name of readdirSync(new URL("lock/", vectors)).sort()) {
+  const base = `lock/${name}/`;
+  if (!existsSync(new URL(`${base}expected.json`, vectors))) continue;
+  const { event } = JSON.parse(read(`${base}expected.json`));
+  if (event === null) continue;
+  const named = JSON.parse(read(`${base}listing.json`)).tools.filter(
+    (t) => t !== null && typeof t === "object" && !Array.isArray(t) && typeof t.name === "string",
+  );
+  const ok = named.length === event.tools.length && named.every((t, i) => digest(t) === event.tools[i].served);
+  report(ok, `event ${name}`, `${event.tools.length} rows`);
 }
 
 console.log(`${total - failed} of ${total} agree`);

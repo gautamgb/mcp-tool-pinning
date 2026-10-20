@@ -1,8 +1,9 @@
-"""Reference checker for the lock format, draft 1c (spec/mcp-lock-draft-1.md).
+"""Reference checker for the lock format, draft 1 revision 1d (spec/mcp-lock-draft-1.md).
 
 It exists to pin the spec down against the vectors in vectors/. It reads a lock, checks
-listings against it, decides calls, classifies upstream frames and runs the session steps of
-section 12. It does not write locks, verify Sigstore bundles or emit events; a host does those.
+listings against it, builds the listing event, decides calls, classifies upstream frames,
+checks host configuration paths and runs the session steps of section 12. It does not write
+locks or verify Sigstore bundles; a host does those.
 """
 
 from __future__ import annotations
@@ -31,6 +32,9 @@ DEFAULT_PORTS = {"http": 80, "https": 443}
 DEFAULT_MAX_STALENESS = 60.0
 META_CHANGED = "meta-changed"
 META_UNAPPROVED = "meta-unapproved"
+EVENT_SCHEMA = "mcpindex.lock.event/1"
+# Section 9.2.2: the requests whose response may carry instructions.
+HANDSHAKE_METHODS = ("initialize", "server/discover")
 
 # Section 4.4: every pattern is ASCII-only and matched with fullmatch. `\d` would accept other
 # scripts' digits and `$` would accept a trailing newline, so neither is used.
@@ -538,6 +542,35 @@ def load_lock(root: Path, config: ReaderConfig | None = None) -> Lock:
     return Lock(shards=shards, aliases=aliases, sequence=sequence)
 
 
+def reader_config_for(config: Mapping[str, Any]) -> ReaderConfig:
+    """A vector's config.json as a ReaderConfig. testVerifier "accept-any" is a test-runner
+    stub that accepts every bundle, so a case can reach the checks after verification."""
+    stub = config.get("testVerifier")
+    if stub not in (None, "accept-any"):
+        raise ValueError(f"unknown testVerifier {stub!r}")
+    return ReaderConfig(
+        require_manifest=config.get("requireManifest", False),
+        signer=config.get("signer"),
+        sequence_store=config.get("sequenceStore", False),
+        last_sequence=config.get("lastSequence"),
+        verify_signature=(lambda manifest, bundle, signer: True) if stub else None,
+    )
+
+
+def apply_setup(root: Path) -> None:
+    """Create the symlinks and files a lock case's setup.json lists (git cannot carry them)."""
+    setup_path = root / "setup.json"
+    if not setup_path.exists():
+        return
+    setup = json.loads(setup_path.read_text(encoding="utf-8"))
+    for link in setup.get("symlinks", []):
+        (root / link["path"]).parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(link["target"], root / link["path"])
+    for item in setup.get("files", []):
+        (root / item["path"]).parent.mkdir(parents=True, exist_ok=True)
+        (root / item["path"]).write_text(item["text"], encoding="utf-8")
+
+
 # Checking
 
 
@@ -556,6 +589,10 @@ class Decision:
     # Section 9.2.3, for each shown tool that has a top-level _meta: whether the host relays
     # it, and the flag (meta-changed, meta-unapproved or None).
     meta: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Section 10: one row per listing entry with a string name, in listing order.
+    tools: list[dict[str, Any]] = field(default_factory=list)
+    # Entries in the listing's tools array, named or not.
+    served: int = 0
 
 
 def check_listing(
@@ -569,7 +606,14 @@ def check_listing(
         raise TypeError("listing has no tools array")
     served_instructions = listing.get("instructions")
     has_instructions = served_instructions is not None
-    decision = Decision()
+    decision = Decision(served=len(raw_tools))
+
+    def row(name: str, served: str | None, approved: str | None, reason: str | None, meta: str | None,
+            shown: bool) -> None:
+        decision.tools.append(
+            {"name": name, "served": served, "approved": approved,
+             "decision": "shown" if shown else "withheld", "reason": reason, "meta": meta}
+        )
 
     def name_of(tool: Any) -> str | None:
         name = tool.get("name") if isinstance(tool, dict) else None
@@ -580,6 +624,7 @@ def check_listing(
         for tool in raw_tools:
             if (name := name_of(tool)) is not None:
                 decision.withheld[name] = lock.reason
+                row(name, tool_digest(tool), None, lock.reason, None, shown=False)
         decision.strip_instructions = has_instructions
         return decision
 
@@ -602,22 +647,24 @@ def check_listing(
             reason = "upstream-changed"
         else:
             reason = None
+        approved = shard.tools.get(name) if shard is not None else None
         if reason is not None and guard:
             decision.withheld[name] = reason
+            row(name, digest, approved, reason, None, shown=False)
             continue
         if reason is not None:
             decision.flagged[name] = reason
         decision.shown.append(name)
         decision.callable.add(name)
+        flag: str | None = None
         if "_meta" in tool:
             approved_meta = shard.meta.get(name) if shard is not None else None
             if approved_meta is None:
-                flag: str | None = META_UNAPPROVED
+                flag = META_UNAPPROVED
             elif meta_digest(tool["_meta"]) != approved_meta:
                 flag = META_CHANGED
-            else:
-                flag = None
             decision.meta[name] = {"relay": flag is None or not guard, "flag": flag}
+        row(name, digest, approved, reason, flag, shown=True)
 
     if shard is not None:
         decision.removed = sorted(set(shard.tools) - set(counts))
@@ -628,6 +675,32 @@ def check_listing(
             decision.instructions = "instructions-changed"
             decision.strip_instructions = guard
     return decision
+
+
+def listing_event(decision: Decision, identity: Mapping[str, Any], posture: str, host: str) -> dict[str, Any]:
+    """Section 10 listing event, without `id`, `time` and the optional `snapshotId`.
+
+    Every served entry that is not shown counts as withheld, entries without a string name
+    included. Under a whole-lock failure `instructions` is null: the instructions are withheld
+    with everything else and the lock error says why.
+    """
+    return {
+        "schema": EVENT_SCHEMA,
+        "type": "listing",
+        "host": host,
+        "server": {"h16": identity_h16(identity), "slug": slug(identity)},
+        "posture": posture,
+        "lockError": decision.lock_error,
+        "counts": {
+            "served": decision.served,
+            "shown": len(decision.shown),
+            "withheld": decision.served - len(decision.shown),
+            "removed": len(decision.removed),
+        },
+        "tools": [dict(r) for r in decision.tools],
+        "removed": list(decision.removed),
+        "instructions": None if decision.lock_error is not None else decision.instructions,
+    }
 
 
 def check_call(decision: Decision | None, name: str) -> str:
@@ -684,16 +757,70 @@ def classify_frame(frame: Any, inflight: Sequence[Any], handshake: Sequence[Any]
     return "relay"
 
 
-# Sessions (sections 9.2.1, 9.5 and 9.8)
+def split_pending(pending: Sequence[Mapping[str, Any]]) -> tuple[list[Any], list[Any]]:
+    """Ids of the unanswered tools/list requests, and of the unanswered handshake requests
+    (initialize or server/discover), from a list of {"id", "method"} records."""
+    inflight = [p["id"] for p in pending if p["method"] == "tools/list"]
+    handshake = [p["id"] for p in pending if p["method"] in HANDSHAKE_METHODS]
+    return inflight, handshake
+
+
+# Host configuration paths (section 8.2)
+
+
+def repository_root(lock_root: Path) -> Path:
+    """The repository that holds the lock: the nearest directory at or above the lock root
+    that has a `.git` entry (a directory, or a file as in a worktree), else the lock root."""
+    start = Path(os.path.realpath(lock_root))
+    for candidate in (start, *start.parents):
+        if os.path.lexists(candidate / ".git"):
+            return candidate
+    return start
+
+
+def _resolved(path: Path) -> Path:
+    """realpath of the nearest existing ancestor, with the rest of the path appended."""
+    path = Path(os.path.abspath(path))
+    rest: list[str] = []
+    probe = path
+    while not os.path.lexists(probe) and probe != probe.parent:
+        rest.append(probe.name)
+        probe = probe.parent
+    return Path(os.path.realpath(probe)).joinpath(*reversed(rest))
+
+
+def _within(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
+
+def host_path_problem(lock_root: Path, paths: Mapping[str, str | Path | None]) -> str | None:
+    """None if every named host path (sequencePath, trustedRoot) lies outside the repository
+    that holds the lock, else what is wrong. Both the path as given, made absolute, and its
+    resolved form are checked, against the repository root as given and resolved."""
+    repo = repository_root(lock_root)
+    roots = {repo, Path(os.path.abspath(lock_root))}
+    for key, value in paths.items():
+        if value is None:
+            continue
+        given = Path(os.path.abspath(value))
+        for candidate in (given, _resolved(given)):
+            if any(_within(candidate, root) for root in roots):
+                return f"{key} lies inside the repository that holds the lock ({repo})"
+    return None
+
+
+# Sessions (sections 9.2.1, 9.2.2, 9.5 and 9.8)
 
 
 class Session:
     """One connection's call gate, driven by the steps of a session.json vector.
 
-    The lock is loaded for every listing. A call made while a listing is in progress gets
-    no-listing. A call checked against a snapshot older than `max_staleness` seconds reloads
-    the lock first; the reload re-checks the latest listing and can only remove names from the
-    allow-list, and a failed reload refuses the call with lock-stale.
+    The lock is loaded for every listing. Calls are decided in the order of section 9.5. A call
+    checked against a snapshot older than `max_staleness` seconds reloads the lock first; the
+    reload re-checks the latest listing and can only remove names from the allow-list, and a
+    failed reload refuses the call with lock-stale. Server frames are classified as section
+    9.2.2 says; a dropped frame that answers a pending request ends it with an error, and a
+    dropped answer to the listing's tools/list fails the listing.
     """
 
     def __init__(
@@ -710,12 +837,19 @@ class Session:
         self.config = config
         self.max_staleness = max_staleness
         self.now = 0.0
+        # The latest completed listing: its decision, its tools and when its snapshot loaded.
         self.decision: Decision | None = None
-        self.loaded_at = 0.0
         self.listing: Mapping[str, Any] | None = None
-        self.in_progress = False
+        self.loaded_at = 0.0
+        # The latest listing failed (section 9.5).
         self.failed = False
         self.due = False
+        # Unanswered host requests, in order: {"id", "method"}.
+        self.pending: list[dict[str, Any]] = []
+        # Id of the tools/list request of the listing in progress, if any.
+        self.listing_id: Any = None
+        self.in_progress = False
+        self._seq = 0
 
     def _load(self) -> Lock | LockError:
         try:
@@ -723,34 +857,78 @@ class Session:
         except LockError as exc:
             return exc
 
-    def list_start(self) -> None:
-        self.in_progress = True
+    def _take(self, rid: Any) -> dict[str, Any] | None:
+        for index, request in enumerate(self.pending):
+            if _id_matches(rid, [request["id"]]):
+                return self.pending.pop(index)
+        return None
 
-    def list_complete(self, listing: Mapping[str, Any]) -> None:
+    def request(self, rid: Any, method: str) -> None:
+        self.pending.append({"id": rid, "method": method})
+
+    def list_start(self, rid: Any = None) -> Any:
+        """Send a cursorless tools/list. An earlier listing in progress is abandoned and its
+        request answered with an error. Returns the request id."""
+        if rid is None:
+            self._seq += 1
+            rid = f"list-{self._seq}"
+        if self.in_progress:
+            self._take(self.listing_id)
+        self.request(rid, "tools/list")
+        self.listing_id = rid
+        self.in_progress = True
+        return rid
+
+    def list_complete(self, listing: Mapping[str, Any]) -> Decision:
+        self._take(self.listing_id)
         self.decision = check_listing(self._load(), self.identity, listing, self.posture)
         self.listing = listing
         self.loaded_at = self.now
         self.in_progress = self.failed = self.due = False
+        self.listing_id = None
+        return self.decision
 
     def list_fail(self) -> None:
+        self._take(self.listing_id)
         self.in_progress = False
         self.failed = True
-        self.decision = None
-        self.listing = None
+        self.listing_id = None
 
     def list_changed(self) -> None:
         self.due = True
 
+    def frame(self, frame: Any) -> tuple[str, Any]:
+        """Classify one server frame other than a listing page. Returns the kind and the id
+        of the host request answered with a JSON-RPC error because of it, or None."""
+        inflight, handshake = split_pending(self.pending)
+        kind = classify_frame(frame, inflight, handshake)
+        if kind == "listing":
+            raise ValueError("listing pages are list-complete or list-fail steps")
+        if not isinstance(frame, dict) or "id" not in frame:
+            return kind, None
+        if kind == "relay" and "method" in frame:
+            return kind, None  # a request from the server; its id is the server's
+        request = self._take(frame["id"])
+        if kind != "drop" or request is None:
+            return kind, None
+        if self.in_progress and _id_matches(request["id"], [self.listing_id]):
+            self.in_progress = False
+            self.failed = True
+            self.listing_id = None
+        return kind, request["id"]
+
     def call(self, name: str) -> str:
-        if self.in_progress:
+        # 1. no-listing: a listing is in progress, or none has ended on this connection.
+        if self.in_progress or (self.decision is None and not self.failed):
             return "no-listing"
-        if self.failed:
-            return "unreachable"
         decision = self.decision
-        if decision is None or self.listing is None:
-            return "no-listing"
-        if decision.lock_error is not None:
+        # 2. The lock failure, when the latest completed listing was decided under 9.4.
+        if decision is not None and decision.lock_error is not None:
             return decision.lock_error
+        # 3. unreachable, when the latest listing failed.
+        if self.failed or decision is None or self.listing is None:
+            return "unreachable"
+        # 4. lock-stale (section 9.8).
         if self.now - self.loaded_at > self.max_staleness:
             lock = self._load()
             if isinstance(lock, LockError):
@@ -760,30 +938,40 @@ class Session:
                 decision.withheld[dropped] = fresh.withheld.get(dropped, "not-listed")
             decision.callable &= fresh.callable
             self.loaded_at = self.now
+        # 5 and 6.
         return check_call(decision, name)
 
 
 def run_session(root: Path, steps: Sequence[Mapping[str, Any]], session: Session) -> list[str]:
-    """Run session.json steps. Returns a description of every call whose verdict differs."""
+    """Run session.json steps. Returns a description of every step whose outcome differs."""
     mismatches: list[str] = []
     for index, step in enumerate(steps):
         op = step["op"]
         if op == "list-start":
-            session.list_start()
+            session.list_start(step.get("id"))
         elif op == "list-complete":
             session.list_complete(json.loads((root / step["listing"]).read_text(encoding="utf-8")))
         elif op == "list-fail":
             session.list_fail()
         elif op == "list-changed":
             session.list_changed()
+        elif op == "request":
+            session.request(step["id"], step["method"])
+        elif op == "frame":
+            got = session.frame(step["frame"])
+            want = (step["expect"], step["errorTo"])
+            if got != want or (got[1] is not None and type(got[1]) is not type(want[1])):
+                mismatches.append(f"step {index}: frame gave {got!r}, expected {want!r}")
         elif op == "clock":
             session.now += float(step["advance"])
         elif op == "write":
             (root / step["path"]).write_bytes(step["text"].encode("utf-8"))
         elif op == "call":
-            got = session.call(step["tool"])
-            if got != step["expect"]:
-                mismatches.append(f"step {index}: call {step['tool']!r} gave {got!r}, expected {step['expect']!r}")
+            got_call = session.call(step["tool"])
+            if got_call != step["expect"]:
+                mismatches.append(
+                    f"step {index}: call {step['tool']!r} gave {got_call!r}, expected {step['expect']!r}"
+                )
         else:
             raise ValueError(f"unknown session op {op!r}")
     return mismatches

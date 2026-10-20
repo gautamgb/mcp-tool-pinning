@@ -7,7 +7,9 @@ Digests, contract files, shard filenames and SHA256SUMS are computed here, never
 hand. Expected outcomes are declared by hand: for digest cases the generator only checks that
 the computed digest has the declared shape (present or absent, equal to or different from a
 named case); for lock cases expected.json is the declaration, and tests/test_lockref.py checks
-the reference checker against it.
+the reference checker against it. The listing event in expected.json is the one exception: it
+is computed by the reference checker, and the build fails unless every decision in it agrees
+with the hand-written declaration.
 """
 
 from __future__ import annotations
@@ -26,14 +28,24 @@ from typing import Any
 
 from mcp_tool_pinning.digest import canonical_body, instructions_digest, meta_digest, tool_digest
 from mcp_tool_pinning.lockref import (
+    LockError,
+    Session,
+    apply_setup,
+    check_listing,
     classify_frame,
     command_identity,
+    host_path_problem,
     identity_h16,
     identity_key,
+    listing_event,
+    load_lock,
     package_identity,
+    reader_config_for,
     remote_identity,
+    run_session,
     shard_filename,
     slug,
+    split_pending,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -590,6 +602,7 @@ SEARCH_COPY = {**SEARCH, "description": "Search the docs, second copy."}
 INSTRUCTIONS = "Docs server. Call search before fetch."
 INSTRUCTIONS_CHANGED = INSTRUCTIONS + " MARKER: instructions changed."
 
+HOST = "vectors"
 APPROVAL = {"subject": "github:docs-owner", "at": "2026-10-19T17:00:00Z", "via": "pr", "ref": "pr-42"}
 
 
@@ -675,7 +688,7 @@ class Builder:
         self.write("server.json", dump(identity))
 
     def config(self, posture: str = "guard", **extra: Any) -> None:
-        self.write("config.json", dump({"posture": posture, **extra}))
+        self.write("config.json", dump({"posture": posture, "host": HOST, **extra}))
 
     def manifest(self, sequence: int = 1, extra: tuple[str, ...] = ()) -> None:
         lock = self.root / ".mcp/lock"
@@ -1349,6 +1362,68 @@ def case_session_stale_reload_fails(b: Builder) -> None:
     )
 
 
+def frame_step(body: Any, expect: str, error_to: Any = None) -> dict[str, Any]:
+    return {"op": "frame", "frame": body, "expect": expect, "errorTo": error_to}
+
+
+def case_session_dropped_answer(b: Builder) -> None:
+    session_base(b)
+    evil = {"jsonrpc": "2.0", "result": TOOLS_RESULT}
+    b.session(
+        [
+            {"op": "list-start", "id": 1},
+            frame_step({**evil, "id": "1"}, "drop"),
+            call("search", "no-listing"),
+            complete("listing-1.json"),
+            call("search", "allow"),
+            frame_step({**evil, "id": 1}, "drop"),
+            call("search", "allow"),
+            {"op": "list-start", "id": "L2"},
+            frame_step({**evil, "id": "L2", "method": "x"}, "drop", "L2"),
+            call("search", "unreachable"),
+            {"op": "request", "id": 7, "method": "resources/list"},
+            frame_step({**evil, "id": 7}, "drop", 7),
+            call("search", "unreachable"),
+            START,
+            complete("listing-1.json"),
+            call("search", "allow"),
+            call("evil", "not-listed"),
+        ]
+    )
+
+
+def case_session_lock_broken_listing_fails(b: Builder) -> None:
+    shard = session_base(b)
+    path = f".mcp/lock/{shard}"
+    restored = (b.root / path).read_text(encoding="utf-8")
+    b.session(
+        [
+            START,
+            FAIL,
+            call("search", "unreachable"),
+            {"op": "write", "path": path, "text": "{not json\n"},
+            START,
+            complete("listing-1.json"),
+            call("search", "lock-unreadable"),
+            START,
+            call("search", "no-listing"),
+            FAIL,
+            call("search", "lock-unreadable"),
+            {"op": "write", "path": path, "text": restored},
+            clock(61),
+            call("search", "lock-unreadable"),
+            START,
+            complete("listing-1.json"),
+            call("search", "allow"),
+            START,
+            FAIL,
+            call("search", "unreachable"),
+            clock(61),
+            call("search", "unreachable"),
+        ]
+    )
+
+
 def case_call_before_listing(b: Builder) -> None:
     b.shard(REMOTE, [SEARCH, FETCH], INSTRUCTIONS)
     b.server(REMOTE)
@@ -1486,9 +1561,78 @@ LOCK_CASES: dict[str, tuple[Callable[[Builder], None], str]] = {
         case_session_stale_reload_fails,
         "A failed reload is lock-stale; a whole-lock failure on a listing is reported before lock-stale.",
     ),
+    "session-dropped-answer": (
+        case_session_dropped_answer,
+        (
+            "A dropped frame that answers a pending request ends it with an error; for the listing's "
+            "tools/list the listing fails."
+        ),
+    ),
+    "session-lock-broken-listing-fails": (
+        case_session_lock_broken_listing_fails,
+        (
+            "Call reason order: a whole-lock failure on the latest completed listing comes before "
+            "unreachable from a later failed listing."
+        ),
+    ),
     "call-before-listing": (case_call_before_listing, "Calls before any listing are refused."),
     "calls": (case_calls, "Calls to an approved, a withheld and an unlisted tool."),
 }
+
+
+def listing_event_for(root: Path, name: str, expected: dict[str, Any]) -> dict[str, Any] | None:
+    """The listing event the reference checker gives for a case, after checking that every
+    decision in it agrees with the declared expectation. None when the case has no listing."""
+    if not (root / "listing.json").exists():
+        return None
+    with tempfile.TemporaryDirectory() as tmp:
+        case = Path(tmp) / name
+        shutil.copytree(root, case)
+        apply_setup(case)
+        config = json.loads((case / "config.json").read_text(encoding="utf-8"))
+        identity = json.loads((case / "server.json").read_text(encoding="utf-8"))
+        try:
+            lock: Any = load_lock(case, reader_config_for(config))
+        except LockError as exc:
+            lock = exc
+        listing = json.loads((case / "listing.json").read_text(encoding="utf-8"))
+        decision = check_listing(lock, identity, listing, config["posture"])
+        event = listing_event(decision, identity, config["posture"], config["host"])
+    reasons = {**expected["withheld"], **expected["flagged"]}
+    shown = [row["name"] for row in event["tools"] if row["decision"] == "shown"]
+    problems = []
+    if shown != expected["shown"]:
+        problems.append(f"shown {shown}")
+    for row in event["tools"]:
+        if row["reason"] != reasons.get(row["name"]):
+            problems.append(f"{row['name']} reason {row['reason']}")
+        want_meta = expected["meta"].get(row["name"], {}).get("flag")
+        if row["meta"] != want_meta:
+            problems.append(f"{row['name']} meta {row['meta']}")
+    if event["lockError"] != expected["lockError"] or event["removed"] != expected["removed"]:
+        problems.append("lockError or removed")
+    if event["lockError"] is None and event["instructions"] != expected["instructions"]:
+        problems.append("instructions")
+    if problems:
+        raise SystemExit(f"{name}: listing event disagrees with the declaration: {problems}")
+    return event
+
+
+def check_session(root: Path, name: str) -> None:
+    """Fail the build if the reference checker disagrees with a declared session."""
+    if not (root / "session.json").exists():
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        case = Path(tmp) / name
+        shutil.copytree(root, case)
+        apply_setup(case)
+        config = json.loads((case / "config.json").read_text(encoding="utf-8"))
+        identity = json.loads((case / "server.json").read_text(encoding="utf-8"))
+        session = Session(case, identity, config["posture"], reader_config_for(config), config.get("maxStaleness", 60))
+        steps = json.loads((case / "session.json").read_text(encoding="utf-8"))["steps"]
+        mismatches = run_session(case, steps, session)
+    if mismatches:
+        raise SystemExit(f"{name}: session declared differently from the reference: {mismatches}")
 
 
 def build_lock(out: Path) -> None:
@@ -1498,9 +1642,11 @@ def build_lock(out: Path) -> None:
         fn(b)
         if not b.expected:
             raise SystemExit(f"{name}: no expectation declared")
-        b.write("expected.json", dump(b.expected))
         if b.setup:
             b.write("setup.json", dump(b.setup))
+        b.expected["event"] = listing_event_for(b.root, name, b.expected)
+        b.write("expected.json", dump(b.expected))
+        check_session(b.root, name)
         index[name] = note
     (out / "lock" / "index.json").write_text(dump(index), encoding="utf-8")
 
@@ -1514,61 +1660,146 @@ def frame(**members: Any) -> dict[str, Any]:
     return {"jsonrpc": "2.0", **members}
 
 
-# (name, note, inflight ids, handshake id or None, frame, expected)
-FRAME_CASES: list[tuple[str, str, list[Any], Any, Any, str]] = [
-    ("listing-number-id", "Answers an in-flight tools/list.", [1], None, frame(id=1, result=TOOLS_RESULT), "listing"),
-    ("listing-string-id", "String ids match equal strings.", ["a"], None, frame(id="a", result=TOOLS_RESULT),
+def L(rid: Any) -> dict[str, Any]:
+    return {"id": rid, "method": "tools/list"}
+
+
+def I(rid: Any) -> dict[str, Any]:
+    return {"id": rid, "method": "initialize"}
+
+
+def D(rid: Any) -> dict[str, Any]:
+    return {"id": rid, "method": "server/discover"}
+
+
+def R(rid: Any, method: str) -> dict[str, Any]:
+    return {"id": rid, "method": method}
+
+
+DISCOVER_RESULT = {"supportedVersions": ["2026-06-30"], "instructions": "x"}
+
+# (name, note, pending host requests, frame, expected)
+FRAME_CASES: list[tuple[str, str, list[dict[str, Any]], Any, str]] = [
+    ("listing-number-id", "Answers an in-flight tools/list.", [L(1)], frame(id=1, result=TOOLS_RESULT), "listing"),
+    ("listing-string-id", "String ids match equal strings.", [L("a")], frame(id="a", result=TOOLS_RESULT),
      "listing"),
-    ("listing-error", "An error answer to an in-flight tools/list ends that listing.", [1], None,
+    ("listing-error", "An error answer to an in-flight tools/list ends that listing.", [L(1)],
      frame(id=1, error={"code": -32603, "message": "x"}), "listing"),
-    ("string-is-not-number", "\"1\" does not answer request 1.", [1], None, frame(id="1", result=TOOLS_RESULT),
+    ("string-is-not-number", "\"1\" does not answer request 1.", [L(1)], frame(id="1", result=TOOLS_RESULT),
      "drop"),
-    ("number-is-not-string", "1 does not answer request \"1\".", ["1"], None, frame(id=1, result=TOOLS_RESULT),
+    ("number-is-not-string", "1 does not answer request \"1\".", [L("1")], frame(id=1, result=TOOLS_RESULT),
      "drop"),
-    ("true-is-not-one", "true does not answer request 1.", [1], None, frame(id=True, result=TOOLS_RESULT), "drop"),
-    ("null-id", "A null id answers nothing, even if the host sent a request with a null id.", [None], None,
+    ("true-is-not-one", "true does not answer request 1.", [L(1)], frame(id=True, result=TOOLS_RESULT), "drop"),
+    ("null-id", "A null id answers nothing, even if the host sent a request with a null id.", [L(None)],
      frame(id=None, result=TOOLS_RESULT), "drop"),
-    ("no-id", "A result without an id.", [1], None, frame(result=TOOLS_RESULT), "drop"),
-    ("unmatched-id", "No tools/list with this id is in flight.", [1], None, frame(id=2, result=TOOLS_RESULT),
+    ("no-id", "A result without an id.", [L(1)], frame(result=TOOLS_RESULT), "drop"),
+    ("unmatched-id", "No tools/list with this id is in flight.", [L(1)], frame(id=2, result=TOOLS_RESULT),
      "drop"),
-    ("method-and-result", "A frame with both method and result is not a response.", [1], None,
+    ("method-and-result", "A frame with both method and result is not a response.", [L(1)],
      frame(id=1, method="x", result=TOOLS_RESULT), "drop"),
-    ("method-null-and-result", "A method member, even null, makes it not a response.", [1], None,
+    ("method-null-and-result", "A method member, even null, makes it not a response.", [L(1)],
      frame(id=1, method=None, result=TOOLS_RESULT), "drop"),
-    ("inflight-before-handshake", "initialize \"1\" and tools/list 1 in flight; 1 is the listing.", [1], "1",
-     frame(id=1, result=TOOLS_RESULT), "listing"),
-    ("same-id-both", "One id on both: the in-flight tools/list wins.", [7], 7, frame(id=7, result=TOOLS_RESULT),
-     "listing"),
-    ("handshake-exact", "Answers the in-flight initialize.", [], 0,
+    ("inflight-before-handshake", "initialize \"1\" and tools/list 1 in flight; 1 is the listing.",
+     [I("1"), L(1)], frame(id=1, result=TOOLS_RESULT), "listing"),
+    ("same-id-both", "One id on both: the in-flight tools/list wins.", [I(7), L(7)],
+     frame(id=7, result=TOOLS_RESULT), "listing"),
+    ("handshake-exact", "Answers the in-flight initialize.", [I(0)],
      frame(id=0, result={"protocolVersion": "2025-11-25", "instructions": "x"}), "handshake"),
-    ("handshake-with-tools", "An initialize answer that carries tools.", [], 0,
+    ("handshake-with-tools", "An initialize answer that carries tools.", [I(0)],
      frame(id=0, result={"protocolVersion": "2025-11-25", **TOOLS_RESULT}), "drop"),
-    ("handshake-loose", "0 does not answer initialize \"0\"; it carries instructions.", [], "0",
+    ("handshake-loose", "0 does not answer initialize \"0\"; it carries instructions.", [I("0")],
      frame(id=0, result={"protocolVersion": "2025-11-25", "instructions": "x"}), "drop"),
-    ("false-is-not-zero", "false does not answer initialize 0.", [], 0,
+    ("false-is-not-zero", "false does not answer initialize 0.", [I(0)],
      frame(id=False, result={"protocolVersion": "2025-11-25", "instructions": "x"}), "drop"),
-    ("other-response", "A response to some other request is relayed.", [1], 0, frame(id=5, result={"content": []}),
+    ("discover-handshake", "Answers the in-flight server/discover; its instructions are checked.", [D(3)],
+     frame(id=3, result=DISCOVER_RESULT), "handshake"),
+    ("discover-with-tools", "A server/discover answer that carries tools.", [D(3)],
+     frame(id=3, result={**DISCOVER_RESULT, **TOOLS_RESULT}), "drop"),
+    ("discover-loose", "\"3\" does not answer server/discover 3; it carries instructions.", [D(3)],
+     frame(id="3", result=DISCOVER_RESULT), "drop"),
+    ("other-request-instructions", "Only initialize and server/discover answers may carry instructions.",
+     [R(4, "resources/list")], frame(id=4, result={"resources": [], "instructions": "x"}), "drop"),
+    ("other-response", "A response to some other request is relayed.", [L(1), I(0), R(5, "tools/call")],
+     frame(id=5, result={"content": []}), "relay"),
+    ("notification", "A notification is relayed.", [L(1)], frame(method="notifications/tools/list_changed"),
      "relay"),
-    ("notification", "A notification is relayed.", [1], None, frame(method="notifications/tools/list_changed"),
-     "relay"),
-    ("server-request", "A request from the server is relayed.", [1], None,
+    ("server-request", "A request from the server is relayed.", [L(1)],
      frame(id=1, method="sampling/createMessage", params={}), "relay"),
-    ("batch", "A frame that is not an object.", [1], None, [frame(id=1, result=TOOLS_RESULT)], "drop"),
+    ("batch", "A frame that is not an object.", [L(1)], [frame(id=1, result=TOOLS_RESULT)], "drop"),
 ]
 
 
 def build_frames(out: Path) -> None:
     cases = []
-    for name, note, inflight, handshake, body, expect in FRAME_CASES:
-        got = classify_frame(body, inflight, [] if handshake is None else [handshake])
+    for name, note, pending, body, expect in FRAME_CASES:
+        inflight, handshake = split_pending(pending)
+        got = classify_frame(body, inflight, handshake)
         if got != expect:
             raise SystemExit(f"frame case {name}: declared {expect}, reference gives {got}")
-        case: dict[str, Any] = {"name": name, "note": note, "inflight": inflight}
-        if handshake is not None:
-            case["handshake"] = handshake
-        case.update(frame=body, expect=expect)
-        cases.append(case)
+        cases.append({"name": name, "note": note, "pending": pending, "frame": body, "expect": expect})
     (out / "frames.json").write_text(dump(cases), encoding="utf-8")
+
+
+# Host configuration paths (section 8.2)
+
+# (name, note, layout, expected). Paths are relative to an empty directory outside any repository.
+HOST_CASES: list[tuple[str, str, dict[str, Any], str]] = [
+    ("outside-repository", "Both paths outside the git repository that holds the lock.",
+     {"dirs": ["repo/.git", "repo/.mcp/lock", "state"], "lockRoot": "repo",
+      "sequencePath": "state/sequence", "trustedRoot": "state/trusted_root.json"}, "accept"),
+    ("not-yet-created", "A sequence file that does not exist yet, in a directory that does not either.",
+     {"dirs": ["repo/.git", "repo/.mcp/lock"], "lockRoot": "repo",
+      "sequencePath": "state/new/sequence"}, "accept"),
+    ("sequence-in-lock-root", "No repository: the lock root is the boundary.",
+     {"dirs": ["lockroot/.mcp/lock"], "lockRoot": "lockroot", "sequencePath": "lockroot/state/sequence"},
+     "refuse"),
+    ("no-repository-sibling", "No repository: a sibling of the lock root is outside it.",
+     {"dirs": ["work/lock/.mcp/lock", "work/state"], "lockRoot": "work/lock",
+      "sequencePath": "work/state/sequence"}, "accept"),
+    ("sequence-in-repository", "Lock root below the git top-level; the sequence file elsewhere in the repository.",
+     {"dirs": ["repo/.git", "repo/sub/.mcp/lock", "repo/state"], "lockRoot": "repo/sub",
+      "sequencePath": "repo/state/sequence"}, "refuse"),
+    ("trusted-root-in-repository", "The trust root inside the repository, outside the lock root.",
+     {"dirs": ["repo/.git", "repo/sub/.mcp/lock", "state"], "lockRoot": "repo/sub",
+      "sequencePath": "state/sequence", "trustedRoot": "repo/trusted_root.json"}, "refuse"),
+    ("git-file", "A .git file, as in a git worktree, marks the repository too.",
+     {"dirs": ["repo/sub/.mcp/lock", "repo/state"], "files": ["repo/.git"], "lockRoot": "repo/sub",
+      "sequencePath": "repo/state/sequence"}, "refuse"),
+    ("symlink-into-repository", "A path outside the repository that resolves into it.",
+     {"dirs": ["repo/.git", "repo/.mcp/lock", "repo/state"], "lockRoot": "repo",
+      "symlinks": [{"path": "link", "target": "repo/state"}], "sequencePath": "link/sequence"}, "refuse"),
+    ("symlink-out-of-repository", "A path inside the repository that resolves outside it.",
+     {"dirs": ["repo/.git", "repo/.mcp/lock", "state"], "lockRoot": "repo",
+      "symlinks": [{"path": "repo/out", "target": "../state"}], "trustedRoot": "repo/out/trusted_root.json"},
+     "refuse"),
+]
+
+
+def build_host_layout(case: dict[str, Any], base: Path) -> Path:
+    for rel in case.get("dirs", []):
+        (base / rel).mkdir(parents=True, exist_ok=True)
+    for rel in case.get("files", []):
+        (base / rel).parent.mkdir(parents=True, exist_ok=True)
+        (base / rel).write_text("", encoding="utf-8")
+    for link in case.get("symlinks", []):
+        (base / link["path"]).parent.mkdir(parents=True, exist_ok=True)
+        (base / link["path"]).symlink_to(link["target"])
+    return base / str(case["lockRoot"])
+
+
+def build_host_config(out: Path) -> None:
+    cases = []
+    for name, note, layout, expect in HOST_CASES:
+        case = {"name": name, "note": note, **layout, "expect": expect}
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            lock_root = build_host_layout(case, base)
+            paths = {k: (base / case[k]) if case.get(k) else None for k in ("sequencePath", "trustedRoot")}
+            got = "refuse" if host_path_problem(lock_root, paths) else "accept"
+        if got != expect:
+            raise SystemExit(f"host case {name}: declared {expect}, reference gives {got}")
+        cases.append(case)
+    (out / "host-config.json").write_text(dump(cases), encoding="utf-8")
 
 
 def build_sums(out: Path) -> None:
@@ -1585,6 +1816,7 @@ def build(out: Path, legacy_source: Path) -> None:
     build_identity(out)
     build_lock(out)
     build_frames(out)
+    build_host_config(out)
     build_sums(out)
 
 

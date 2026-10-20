@@ -11,20 +11,24 @@ import pytest
 from mcp_tool_pinning.lockref import (
     Lock,
     LockError,
-    ReaderConfig,
     Session,
+    apply_setup,
     check_call,
     check_listing,
     classify_frame,
     command_identity,
+    host_path_problem,
     identity_h16,
     identity_key,
+    listing_event,
     load_lock,
     package_identity,
+    reader_config_for,
     remote_identity,
     run_session,
     shard_filename,
     slug,
+    split_pending,
 )
 
 REPO = Path(__file__).parent.parent
@@ -32,42 +36,34 @@ VECTORS = REPO / "vectors"
 LOCK_CASES = sorted(p.name for p in (VECTORS / "lock").iterdir() if p.is_dir())
 IDENTITY_CASES: list[dict[str, Any]] = json.loads((VECTORS / "identity.json").read_text(encoding="utf-8"))
 FRAME_CASES: list[dict[str, Any]] = json.loads((VECTORS / "frames.json").read_text(encoding="utf-8"))
+HOST_CASES: list[dict[str, Any]] = json.loads((VECTORS / "host-config.json").read_text(encoding="utf-8"))
+
+
+def build_host_layout(case: dict[str, Any], base: Path) -> Path:
+    """Create a host-config case's directories, files and symlinks under `base`."""
+    for rel in case.get("dirs", []):
+        (base / rel).mkdir(parents=True, exist_ok=True)
+    for rel in case.get("files", []):
+        (base / rel).parent.mkdir(parents=True, exist_ok=True)
+        (base / rel).write_text("", encoding="utf-8")
+    for link in case.get("symlinks", []):
+        (base / link["path"]).parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(link["target"], base / link["path"])
+    return base / case["lockRoot"]
 
 
 def materialize(case: str, tmp: Path) -> Path:
     """Copy a lock case and apply its setup.json (symlinks and odd filenames git cannot carry)."""
     root = tmp / case
     shutil.copytree(VECTORS / "lock" / case, root)
-    setup_path = root / "setup.json"
-    if setup_path.exists():
-        setup = json.loads(setup_path.read_text(encoding="utf-8"))
-        for link in setup.get("symlinks", []):
-            (root / link["path"]).parent.mkdir(parents=True, exist_ok=True)
-            os.symlink(link["target"], root / link["path"])
-        for item in setup.get("files", []):
-            (root / item["path"]).parent.mkdir(parents=True, exist_ok=True)
-            (root / item["path"]).write_text(item["text"], encoding="utf-8")
+    apply_setup(root)
     return root
-
-
-def reader_config(config: dict[str, Any]) -> ReaderConfig:
-    """config.json to ReaderConfig. testVerifier "accept-any" is a test-runner stub that
-    accepts every bundle, so the vectors can reach the checks after signature verification."""
-    stub = config.get("testVerifier")
-    assert stub in (None, "accept-any")
-    return ReaderConfig(
-        require_manifest=config.get("requireManifest", False),
-        signer=config.get("signer"),
-        sequence_store=config.get("sequenceStore", False),
-        last_sequence=config.get("lastSequence"),
-        verify_signature=(lambda manifest, bundle, signer: True) if stub else None,
-    )
 
 
 def run_case(root: Path) -> dict[str, Any]:
     config = json.loads((root / "config.json").read_text(encoding="utf-8"))
     identity = json.loads((root / "server.json").read_text(encoding="utf-8"))
-    reader = reader_config(config)
+    reader = reader_config_for(config)
     lock: Lock | LockError
     try:
         lock = load_lock(root, reader)
@@ -79,6 +75,7 @@ def run_case(root: Path) -> dict[str, Any]:
     if listing_path.exists():
         listing = json.loads(listing_path.read_text(encoding="utf-8"))
         decision = check_listing(lock, identity, listing, config["posture"])
+    event = listing_event(decision, identity, config["posture"], config["host"]) if decision else None
     return {
         "lockError": lock.reason if isinstance(lock, LockError) else None,
         "shown": decision.shown if decision else [],
@@ -89,6 +86,7 @@ def run_case(root: Path) -> dict[str, Any]:
         "stripInstructions": decision.strip_instructions if decision else False,
         "calls": {name: check_call(decision, name) for name in expected["calls"]},
         "meta": decision.meta if decision else {},
+        "event": event,
     }
 
 
@@ -102,7 +100,7 @@ def test_lock_vector(case: str, tmp_path: Path) -> None:
         config = json.loads((root / "config.json").read_text(encoding="utf-8"))
         identity = json.loads((root / "server.json").read_text(encoding="utf-8"))
         session = Session(
-            root, identity, config["posture"], reader_config(config), config.get("maxStaleness", 60)
+            root, identity, config["posture"], reader_config_for(config), config.get("maxStaleness", 60)
         )
         steps = json.loads(session_path.read_text(encoding="utf-8"))["steps"]
         assert run_session(root, steps, session) == []
@@ -110,8 +108,18 @@ def test_lock_vector(case: str, tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("case", FRAME_CASES, ids=[c["name"] for c in FRAME_CASES])
 def test_frame_vector(case: dict[str, Any]) -> None:
-    handshake = [case["handshake"]] if "handshake" in case else []
-    assert classify_frame(case["frame"], case["inflight"], handshake) == case["expect"]
+    inflight, handshake = split_pending(case["pending"])
+    assert classify_frame(case["frame"], inflight, handshake) == case["expect"]
+
+
+@pytest.mark.parametrize("case", HOST_CASES, ids=[c["name"] for c in HOST_CASES])
+def test_host_config_vector(case: dict[str, Any], tmp_path: Path) -> None:
+    lock_root = build_host_layout(case, tmp_path)
+    problem = host_path_problem(
+        lock_root,
+        {key: (tmp_path / case[key]) if case.get(key) is not None else None for key in ("sequencePath", "trustedRoot")},
+    )
+    assert ("refuse" if problem else "accept") == case["expect"], problem
 
 
 @pytest.mark.parametrize("case", IDENTITY_CASES, ids=[c["name"] for c in IDENTITY_CASES])
