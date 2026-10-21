@@ -1,8 +1,9 @@
-"""Tool Definition Digest and Tool Set Digest (SEP draft, sections 1 and 2).
+"""Definition Digest and Set Digest (SEP draft, sections 1, 2 and 4).
 
 Both work on the raw JSON objects a server sent, not on SDK models: the SDK's
-pydantic `Tool` drops members it does not know, and the digest has to cover
-the object as received.
+pydantic models drop members they do not know, and the digest has to cover
+the object as received. Section 4 applies the same digest to `Prompt` and
+`ResourceTemplate` objects, so nothing here is specific to tools.
 """
 
 from __future__ import annotations
@@ -40,13 +41,13 @@ def _sha256(data: bytes) -> str:
     return PREFIX + hashlib.sha256(data).hexdigest()
 
 
-def tool_digest(tool: Mapping[str, Any]) -> str | None:
-    """Digest of one raw `Tool` object, or None when it has no digest.
+def definition_digest(definition: Mapping[str, Any]) -> str | None:
+    """Digest of one raw `Tool`, `Prompt` or `ResourceTemplate`, or None when it has none.
 
     Only the top-level `_meta` is removed. A None result means a pinning host
-    treats the tool as unapproved.
+    treats the definition as unapproved.
     """
-    body = {k: v for k, v in tool.items() if k != "_meta"}
+    body = {k: v for k, v in definition.items() if k != "_meta"}
     if not _numbers_in_range(body):
         return None
     try:
@@ -55,16 +56,20 @@ def tool_digest(tool: Mapping[str, Any]) -> str | None:
         return None
 
 
-def tool_set_digest(tools: Iterable[Mapping[str, Any]]) -> str | None:
-    """Digest over every tool's digest, sorted by (name, digest).
+def set_digest(definitions: Iterable[Mapping[str, Any]]) -> str | None:
+    """Digest over every definition's digest, sorted by (name, digest).
 
-    None if any tool has no digest, since the set cannot then be compared.
+    None if any definition has no digest, since the set cannot then be compared.
     """
     pairs: list[tuple[str, str]] = []
-    for tool in tools:
-        digest = tool_digest(tool)
+    for definition in definitions:
+        digest = definition_digest(definition)
         if digest is None:
             return None
-        pairs.append((str(tool.get("name", "")), digest))
+        pairs.append((str(definition.get("name", "")), digest))
     pairs.sort()
     return _sha256(rfc8785.dumps([digest for _, digest in pairs]))
+
+
+tool_digest = definition_digest
+tool_set_digest = set_digest

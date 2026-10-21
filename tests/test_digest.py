@@ -4,7 +4,7 @@ from typing import Any
 
 import pytest
 
-from mcp_tool_pinning.digest import tool_digest, tool_set_digest
+from mcp_tool_pinning.digest import definition_digest, tool_digest, tool_set_digest
 
 VECTORS: list[dict[str, Any]] = json.loads(
     (Path(__file__).parent.parent / "vectors" / "tools.json").read_text(encoding="utf-8")
@@ -14,6 +14,16 @@ VECTORS: list[dict[str, Any]] = json.loads(
 @pytest.mark.parametrize("vector", VECTORS, ids=[v["name"] for v in VECTORS])
 def test_vector(vector: dict[str, Any]) -> None:
     assert tool_digest(vector["tool"]) == vector["expected"]
+
+
+DEFINITION_VECTORS: list[dict[str, Any]] = json.loads(
+    (Path(__file__).parent.parent / "vectors" / "definitions.json").read_text(encoding="utf-8")
+)
+
+
+@pytest.mark.parametrize("vector", DEFINITION_VECTORS, ids=[v["name"] for v in DEFINITION_VECTORS])
+def test_definition_vector(vector: dict[str, Any]) -> None:
+    assert definition_digest(vector["definition"]) == vector["expected"]
 
 
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), -float("inf")])

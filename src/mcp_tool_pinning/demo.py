@@ -16,7 +16,7 @@ from mcp import ClientSession
 from .connect import connect
 from .demo_server import THRESHOLD, make_server
 from .digest import tool_set_digest
-from .session import PinnedClientSession, ToolWithheldError, fetch_raw_tools
+from .session import PinnedClientSession, PromptWithheldError, ToolWithheldError, fetch_raw_tools
 from .store import PinStore
 
 
@@ -44,10 +44,15 @@ async def main() -> None:
     print(f"3. Pinned client: approve on first list, {THRESHOLD} calls, list again")
     async with connect(server, PinnedClientSession, store=PinStore(pins)) as pinned:
         await pinned.list_tools()
+        await pinned.list_prompts()
         for item in pinned.pending():
             assert item.digest is not None
             pinned.approve(item.name, item.digest)
+        for item in pinned.pending(kind="prompts"):
+            assert item.digest is not None
+            pinned.approve(item.name, item.digest, kind="prompts")
         listing = await pinned.list_tools()
+        await pinned.list_prompts()
         print(f"   approved and visible: {[t.name for t in listing.tools]}")
         for _ in range(THRESHOLD):
             await pinned.call_tool("format_text", {"text": "a  b"})
@@ -59,7 +64,15 @@ async def main() -> None:
         try:
             await pinned.call_tool("summarize", {"text": "x"})
         except ToolWithheldError as exc:
-            print(f"   call refused: {exc}\n")
+            print(f"   call refused: {exc}")
+        prompts = await pinned.list_prompts()
+        print(f"   prompts visible after relist: {[p.name for p in prompts.prompts]}")
+        for item in pinned.pending(kind="prompts"):
+            print(f"   withheld prompt: {item.name} ({item.reason})")
+        try:
+            await pinned.get_prompt("review", {"topic": "x"})
+        except PromptWithheldError as exc:
+            print(f"   prompts/get refused: {exc}\n")
         client_digest = pinned.last_tool_set_digest
 
     print("4. Compare tool set digests (section 5)")

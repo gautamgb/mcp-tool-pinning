@@ -10,10 +10,12 @@ const inRange = (v) =>
   : v !== null && typeof v === "object" ? Object.values(v).every(inRange)
   : true;
 
-const vectors = JSON.parse(readFileSync(new URL("../vectors/tools.json", import.meta.url)));
+// tools.json carries a `tool`; definitions.json (prompts, resource templates) a `definition`.
+const load = (file) => JSON.parse(readFileSync(new URL(`../vectors/${file}`, import.meta.url)));
+const vectors = [...load("tools.json"), ...load("definitions.json")];
 let failed = 0;
 for (const v of vectors) {
-  const { _meta, ...body } = v.tool;
+  const { _meta, ...body } = v.tool ?? v.definition;
   const js = inRange(body)
     ? "sha256:" + createHash("sha256").update(canonicalize(body), "utf8").digest("hex")
     : null;
