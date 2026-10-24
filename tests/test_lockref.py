@@ -1,8 +1,10 @@
+import hashlib
 import json
 import os
 import shutil
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +13,7 @@ import pytest
 from mcp_tool_pinning.lockref import (
     Lock,
     LockError,
+    ReaderConfig,
     Session,
     apply_setup,
     check_call,
@@ -107,6 +110,154 @@ def test_lock_vector(case: str, tmp_path: Path) -> None:
         )
         steps = json.loads(session_path.read_text(encoding="utf-8"))["steps"]
         assert run_session(root, steps, session) == []
+
+
+@pytest.fixture
+def signed_lock(tmp_path: Path) -> tuple[Path, ReaderConfig]:
+    root = materialize("sequence-rollback", tmp_path)
+    config = json.loads((root / "config.json").read_text(encoding="utf-8"))
+    return root, reader_config_for(config)
+
+
+def write_manifest(root: Path, sequence: int) -> None:
+    lock_dir = root / ".mcp" / "lock"
+    files = {
+        path.name: "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in lock_dir.iterdir()
+        if path.name not in ("MANIFEST.json", "MANIFEST.json.sigstore")
+    }
+    (lock_dir / "MANIFEST.json").write_text(
+        json.dumps({"lockVersion": "1-draft", "sequence": sequence, "files": files}),
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize("initial_floor", [None, 5])
+def test_accepted_sequence_becomes_the_rollback_floor(
+    signed_lock: tuple[Path, ReaderConfig], initial_floor: int | None
+) -> None:
+    root, reader = signed_lock
+    reader = replace(reader, last_sequence=initial_floor)
+    write_manifest(root, 7)
+    assert load_lock(root, reader).sequence == 7
+
+    write_manifest(root, 6)
+    with pytest.raises(LockError, match="sequence 6 < 7") as exc:
+        load_lock(root, reader)
+    assert exc.value.reason == "lock-signature-invalid"
+
+
+@pytest.mark.parametrize("sequence", [0, 7, 2**53 - 2])
+def test_equal_and_increasing_sequences_are_accepted(
+    signed_lock: tuple[Path, ReaderConfig], sequence: int
+) -> None:
+    root, reader = signed_lock
+    reader = replace(reader, last_sequence=None)
+    for accepted in (sequence, sequence, sequence + 1):
+        write_manifest(root, accepted)
+        assert load_lock(root, reader).sequence == accepted
+
+    write_manifest(root, sequence)
+    with pytest.raises(LockError, match="lock-signature-invalid"):
+        load_lock(root, reader)
+
+
+@pytest.mark.parametrize("failure", ["manifest-hash", "shard", "contract"])
+def test_failed_load_does_not_advance_or_reset_the_floor(
+    signed_lock: tuple[Path, ReaderConfig], failure: str
+) -> None:
+    root, reader = signed_lock
+    write_manifest(root, 7)
+    load_lock(root, reader)
+    shard = next((root / ".mcp" / "lock").glob("*--*.json"))
+    if failure == "contract":
+        damaged = next((root / ".mcp" / "contracts").iterdir())
+    else:
+        damaged = shard
+    original = damaged.read_bytes()
+    if failure == "shard":
+        doc = json.loads(original)
+        doc["lockVersion"] = "unsupported"
+        damaged.write_text(json.dumps(doc), encoding="utf-8")
+    elif failure == "contract":
+        damaged.write_bytes(b"changed")
+    write_manifest(root, 9)
+    if failure == "manifest-hash":
+        damaged.write_bytes(original + b"\n")
+
+    with pytest.raises(LockError):
+        load_lock(root, reader)
+    damaged.write_bytes(original)
+    write_manifest(root, 7)
+    assert load_lock(root, reader).sequence == 7
+    write_manifest(root, 6)
+    with pytest.raises(LockError, match="sequence 6 < 7"):
+        load_lock(root, reader)
+
+
+@pytest.mark.parametrize("reload_path", ["listing", "reconnect", "stale-call"])
+def test_sessions_reject_replayed_approvals(
+    signed_lock: tuple[Path, ReaderConfig], reload_path: str
+) -> None:
+    root, reader = signed_lock
+    identity = json.loads((root / "server.json").read_text(encoding="utf-8"))
+    listing = json.loads((root / "listing.json").read_text(encoding="utf-8"))
+    shard = next((root / ".mcp" / "lock").glob("*--*.json"))
+    approved = shard.read_bytes()
+    revoked = json.loads(approved)
+    del revoked["tools"]["fetch"]
+    shard.write_text(json.dumps(revoked), encoding="utf-8")
+    write_manifest(root, 7)
+    session = Session(root, identity, "guard", reader)
+    session.list_start()
+    session.list_complete(listing)
+    assert session.call("fetch") == "new-tool"
+    assert session.call("search") == "allow"
+
+    shard.write_bytes(approved)
+    write_manifest(root, 6)
+    if reload_path == "stale-call":
+        session.now = session.max_staleness + 1
+        assert session.call("search") == "lock-stale"
+    else:
+        if reload_path == "reconnect":
+            session = Session(root, identity, "guard", reader)
+        session.list_start()
+        assert session.list_complete(listing).lock_error == "lock-signature-invalid"
+        assert session.call("fetch") == "lock-signature-invalid"
+
+
+def test_sequence_floors_are_scoped_to_each_lock_root(
+    signed_lock: tuple[Path, ReaderConfig], tmp_path: Path
+) -> None:
+    root, reader = signed_lock
+    other = tmp_path / "other"
+    shutil.copytree(root, other)
+    write_manifest(root, 10)
+    load_lock(root, reader)
+    write_manifest(other, 6)
+    assert load_lock(other, reader).sequence == 6
+
+
+def test_sequence_floor_survives_an_alternate_path_to_the_same_root(
+    signed_lock: tuple[Path, ReaderConfig], tmp_path: Path
+) -> None:
+    root, reader = signed_lock
+    alias = tmp_path / "alias"
+    alias.symlink_to(root, target_is_directory=True)
+    write_manifest(root, 7)
+    load_lock(root, reader)
+    write_manifest(root, 6)
+    with pytest.raises(LockError, match="sequence 6 < 7"):
+        load_lock(alias, reader)
+
+
+def test_unsigned_loads_do_not_enforce_a_sequence_floor(signed_lock: tuple[Path, ReaderConfig]) -> None:
+    root, reader = signed_lock
+    reader = replace(reader, signer=None)
+    for sequence in (7, 6):
+        write_manifest(root, sequence)
+        assert load_lock(root, reader).sequence == sequence
 
 
 @pytest.mark.parametrize("case", FRAME_CASES, ids=[c["name"] for c in FRAME_CASES])

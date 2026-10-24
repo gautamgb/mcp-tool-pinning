@@ -61,6 +61,11 @@ that passes them. Nothing in `vectors/` is edited by hand:
     uv run python tools/gen_vectors.py          # rebuild vectors/
     uv run python tools/gen_vectors.py --check  # fail if vectors/ is stale
 
+For signed locks, reuse a `ReaderConfig` across sessions to retain the highest accepted
+sequence in memory, separately for each resolved lock root. A sequence advances only after
+the entire lock loads successfully. Durable sequence storage remains the integrating host's
+responsibility; `last_sequence` models its stored floor.
+
 `vectors/SHA256SUMS` covers every file under `vectors/`, for vendoring. The xcheck script
 also runs the raw-text cases, contract files and the served digests in each expected listing
 event through JavaScript.
