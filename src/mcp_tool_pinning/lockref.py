@@ -13,10 +13,12 @@ import json
 import os
 import re
 import stat
+from _thread import LockType
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import Lock as ThreadLock
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -296,7 +298,11 @@ class Lock:
 
 @dataclass(frozen=True)
 class ReaderConfig:
-    """Host configuration. Never read from the lock repository itself."""
+    """Host configuration and reader lifetime. Reuse across sessions to retain sequence floors.
+
+    Configuration is never read from the lock repository itself. Durable sequence storage
+    remains the host's responsibility.
+    """
 
     require_manifest: bool = False
     signer: Mapping[str, Any] | None = None
@@ -305,6 +311,8 @@ class ReaderConfig:
     sequence_store: bool = False
     last_sequence: int | None = None
     verify_signature: Callable[[bytes, bytes, Mapping[str, Any]], bool] | None = None
+    _sequence_floors: dict[Path, int] = field(default_factory=dict, init=False, repr=False, compare=False)
+    _sequence_lock: LockType = field(default_factory=ThreadLock, init=False, repr=False, compare=False)
 
 
 def _reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -369,7 +377,9 @@ def _read_lock_dir(lock_dir: Path) -> dict[str, bytes]:
     return files
 
 
-def _check_manifest(files: dict[str, bytes], config: ReaderConfig) -> int | None:
+def _check_manifest(
+    files: dict[str, bytes], config: ReaderConfig, last_sequence: int | None
+) -> int | None:
     signed = config.signer is not None
     if signed and not config.sequence_store:
         raise LockError("lock-signature-invalid", "signer configured without a sequence store")
@@ -397,8 +407,8 @@ def _check_manifest(files: dict[str, bytes], config: ReaderConfig) -> int | None
     listed = manifest.get("files")
     if type(sequence) is not int or not 0 <= sequence <= SEQUENCE_MAX or not isinstance(listed, dict):
         raise _unreadable("MANIFEST.json sequence or files malformed")
-    if signed and config.last_sequence is not None and sequence < config.last_sequence:
-        raise LockError("lock-signature-invalid", f"sequence {sequence} < {config.last_sequence}")
+    if signed and last_sequence is not None and sequence < last_sequence:
+        raise LockError("lock-signature-invalid", f"sequence {sequence} < {last_sequence}")
     on_disk = set(files) - {MANIFEST, SIGNATURE}
     if set(listed) != on_disk:
         raise _unreadable(f"file set differs from MANIFEST.json: {sorted(set(listed) ^ on_disk)}")
@@ -521,6 +531,16 @@ def _check_shard(filename: str, raw: bytes, contracts: Path) -> Shard:
 def load_lock(root: Path, config: ReaderConfig | None = None) -> Lock:
     """Read and verify the whole lock under `root`. Any failure fails the load."""
     config = config or ReaderConfig()
+    with config._sequence_lock:
+        key = root.resolve()
+        floors = [s for s in (config.last_sequence, config._sequence_floors.get(key)) if s is not None]
+        lock = _load_lock(root, config, max(floors, default=None))
+        if config.signer is not None and lock.sequence is not None:
+            config._sequence_floors[key] = lock.sequence
+        return lock
+
+
+def _load_lock(root: Path, config: ReaderConfig, last_sequence: int | None) -> Lock:
     mcp = root / ".mcp"
     _check_dir(mcp, required=True)
     lock_dir = mcp / "lock"
@@ -528,7 +548,7 @@ def load_lock(root: Path, config: ReaderConfig | None = None) -> Lock:
     contracts = mcp / "contracts"
     _check_dir(contracts, required=False)
     files = _read_lock_dir(lock_dir)
-    sequence = _check_manifest(files, config)
+    sequence = _check_manifest(files, config, last_sequence)
     aliases = _check_aliases(files[ALIASES]) if ALIASES in files else {}
     shards: dict[bytes, Shard] = {}
     for name in sorted(files):
